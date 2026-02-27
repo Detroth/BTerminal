@@ -1,0 +1,12 @@
+# Python
+backend_python/.venv/
+backend_python/__pycache__/
+*.pyc
+
+# Rust
+engine_rust/target/
+**/*.rs.bk
+
+# OS files
+.DS_Store
+Thumbs.db
