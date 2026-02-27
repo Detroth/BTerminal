@@ -29,10 +29,10 @@ You will need two separate terminals to run the microservices.
 
 **1. Start the Python WebSocket Bridge & UI Server:**
 ```bash
-cd backend_python
 python -m venv .venv
 source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
 pip install -r requirements.txt
+cd backend_python
 uvicorn main:app --reload
 ```
 
