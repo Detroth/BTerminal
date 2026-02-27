@@ -1,11 +1,44 @@
 import asyncio
 import os
-from typing import List
+from typing import List, Set
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-app = FastAPI()
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+# --- TELEGRAM BOT SETUP ---
+API_TOKEN = "8475491805:AAHFUOPwmFlfPo3BGYCAv9tm2kB3XHI5pVA"  # Вставьте сюда токен от @BotFather
+
+# Инициализация бота и диспетчера
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
+# Хранилище подписчиков (в памяти)
+subscribed_users: Set[int] = set()
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    subscribed_users.add(message.chat.id)
+    await message.answer("🚀 <b>Терминал запущен.</b>\nОжидаю сигналы с рынка...")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: запускаем поллинг бота в фоне
+    polling_task = asyncio.create_task(dp.start_polling(bot))
+    yield
+    # Shutdown: останавливаем поллинг
+    polling_task.cancel()
+    try:
+        await polling_task
+    except asyncio.CancelledError:
+        pass
+
+app = FastAPI(lifespan=lifespan)
 
 # Менеджер соединений для управления клиентами
 class ConnectionManager:
@@ -46,6 +79,29 @@ async def internal_endpoint(websocket: WebSocket):
         while True:
             data = await websocket.receive_json()
             await manager.broadcast(data)
+            
+            # Обработка сигналов для Telegram
+            if data.get("type") == "momentum":
+                items = data.get("data", [])
+                if not isinstance(items, list):
+                    items = [items]
+                
+                for item in items:
+                    signal = item.get("signal")
+                    symbol = item.get("symbol")
+                    
+                    text = ""
+                    if signal == "MANIPULATION":
+                        text = f"🚨 <b>ВНИМАНИЕ: МАНИПУЛЯЦИЯ!</b>\nВозможен Pump&Dump по {symbol}!"
+                    elif signal == "ORGANIC_TREND":
+                        text = f"📈 <b>Алго-тренд</b>\nНабирают позицию по {symbol}"
+                    
+                    if text:
+                        for chat_id in subscribed_users:
+                            try:
+                                await bot.send_message(chat_id=chat_id, text=text)
+                            except Exception as e:
+                                print(f"Failed to send TG message: {e}")
     except Exception as e:
         print(f"Internal engine disconnected: {e}")
 

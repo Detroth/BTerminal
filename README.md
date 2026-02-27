@@ -38,7 +38,7 @@ uvicorn main:app --reload
 
 **2. Start the Rust Data Engine:**
 ```bash
-cd backend_rust
+cd engine_rust
 cargo run 
 ```
 

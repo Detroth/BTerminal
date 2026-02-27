@@ -4,6 +4,7 @@ use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
 
@@ -57,9 +58,16 @@ struct OkxTicker {
     funding_rate: String,
 }
 
-struct MomentumState {
-    history: VecDeque<(Instant, f64)>,
-    last_alert: Instant,
+struct TickData {
+    price: f64,
+    volume: f64,
+    raw_q: f64,
+    timestamp: u64,
+}
+
+struct ScannerState {
+    history: HashMap<String, VecDeque<TickData>>,
+    cooldowns: HashMap<String, Instant>,
 }
 
 #[tokio::main]
@@ -120,7 +128,10 @@ async fn main() {
     let (_, mut read) = ws_stream.split();
 
     // Хранилище состояний: Symbol -> Last Reference Price
-    let mut momentum_cache: HashMap<String, MomentumState> = HashMap::new();
+    let mut scanner_state = ScannerState {
+        history: HashMap::new(),
+        cooldowns: HashMap::new(),
+    };
 
     while let Some(message) = read.next().await {
         match message {
@@ -141,7 +152,7 @@ async fn main() {
                             }
 
                             // 2. Momentum Scanner
-                            if let Some(mom_msg) = process_momentum(&usdt_events, &mut momentum_cache) {
+                            if let Some(mom_msg) = process_momentum(&usdt_events, &mut scanner_state) {
                                 if let Err(e) = tx.send(Message::Text(mom_msg.to_string())) {
                                     eprintln!("Failed to send momentum: {}", e);
                                 }
@@ -179,55 +190,128 @@ fn process_ticker_tape(events: &[TickerEvent]) -> serde_json::Value {
     })
 }
 
-fn process_momentum(events: &[TickerEvent], cache: &mut HashMap<String, MomentumState>) -> Option<serde_json::Value> {
+fn process_momentum(events: &[TickerEvent], state: &mut ScannerState) -> Option<serde_json::Value> {
     let mut momentum_data = Vec::new();
-    let now = Instant::now();
-    let window_duration = Duration::from_secs(60); // Окно 1 минута
-    let cooldown = Duration::from_secs(30); // Не спамить чаще чем раз в 30 сек
+    let now_instant = Instant::now();
+    let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+    
+    let window_5m = 5 * 60 * 1000;   // 5 minutes in ms
+    let window_2m = 2 * 60 * 1000;   // 2 minutes in ms
+    let window_15s = 15 * 1000;      // 15 seconds in ms
+    let cooldown_duration = Duration::from_secs(15 * 60); // 15 minutes cooldown
 
     for event in events {
         let current_price = event.c.parse::<f64>().unwrap_or(0.0);
+        let current_q = event.q.parse::<f64>().unwrap_or(0.0);
         
-        // Получаем или создаем состояние для тикера
-        let state = cache.entry(event.s.clone()).or_insert(MomentumState {
-            history: VecDeque::new(),
-            last_alert: now - cooldown, // Готов к алерту сразу
+        let history = state.history.entry(event.s.clone()).or_insert_with(VecDeque::new);
+        
+        // 1. Calculate Volume Delta
+        let mut vol_delta = 0.0;
+        if let Some(last_tick) = history.back() {
+            vol_delta = current_q - last_tick.raw_q;
+            if vol_delta < 0.0 { vol_delta = 0.0; } // Reset or anomaly
+        }
+
+        // 2. Add Tick
+        history.push_back(TickData {
+            price: current_price,
+            volume: vol_delta,
+            raw_q: current_q,
+            timestamp: now_ts,
         });
 
-        // 1. Добавляем текущую цену в историю
-        state.history.push_back((now, current_price));
-
-        // 2. Удаляем старые записи (старше window_duration)
-        while let Some(&(time, _)) = state.history.front() {
-            if now.duration_since(time) > window_duration {
-                state.history.pop_front();
+        // 3. Prune old ticks (> 5 mins)
+        while let Some(tick) = history.front() {
+            if now_ts - tick.timestamp > window_5m {
+                history.pop_front();
             } else {
                 break;
             }
         }
-        
-        let mut triggered = false;
-        let mut direction = "NEUTRAL";
-        let mut change_pct = 0.0;
 
-        // 3. Сравниваем с самой старой ценой в окне (начало окна)
-        if let Some(&(_, start_price)) = state.history.front() {
-            change_pct = (current_price - start_price) / start_price;
+        // 4. Check Cooldown
+        if let Some(last_alert) = state.cooldowns.get(&event.s) {
+            if now_instant.duration_since(*last_alert) < cooldown_duration {
+                continue;
+            }
+        }
+        
+        // 5. Calculate Metrics
+        let mut vol_15s = 0.0;
+        let mut vol_2m = 0.0;
+        let mut vol_5m = 0.0;
+
+        for tick in history.iter() {
+            let age = now_ts - tick.timestamp;
+            if age <= window_5m { vol_5m += tick.volume; }
+            if age <= window_2m { vol_2m += tick.volume; }
+            if age <= window_15s { vol_15s += tick.volume; }
+        }
+
+        // Find reference prices
+        let target_15s = now_ts.saturating_sub(window_15s);
+        let target_2m = now_ts.saturating_sub(window_2m);
+        
+        let get_price_at = |target: u64| -> f64 {
+            history.iter()
+                .min_by_key(|t| (t.timestamp as i64 - target as i64).abs())
+                .map(|t| t.price)
+                .unwrap_or(current_price)
+        };
+
+        let price_15s_ago = get_price_at(target_15s);
+        let price_2m_ago = get_price_at(target_2m);
+
+        let change_15s = if price_15s_ago > 0.0 { (current_price - price_15s_ago) / price_15s_ago } else { 0.0 };
+        let change_2m = if price_2m_ago > 0.0 { (current_price - price_2m_ago) / price_2m_ago } else { 0.0 };
+
+        // Calculate Rates (Volume per second)
+        let rate_15s = vol_15s / 15.0;
+        let rate_2m = vol_2m / 120.0;
+        
+        // Calculate Norms (Average rate of the REST of the 5m window)
+        // This compares current burst against background noise
+        let norm_15s = if vol_5m > vol_15s { (vol_5m - vol_15s) / (300.0 - 15.0) } else { 0.0 };
+        let norm_2m = if vol_5m > vol_2m { (vol_5m - vol_2m) / (300.0 - 120.0) } else { 0.0 };
+
+        let mut signal_type = "";
+        let mut msg = "";
+        let mut direction = "NEUTRAL";
+        let mut final_change = 0.0;
+
+        // Logic 1: Manipulation (Micro-burst)
+        // Volume rate 15s > 20x Background rate, Price > 1.5%
+        let is_manipulation = if norm_15s > 0.0 { rate_15s > 20.0 * norm_15s } else { rate_15s > 0.0 };
+        
+        if is_manipulation && change_15s.abs() > 0.015 {
+            signal_type = "MANIPULATION";
+            msg = "Искусственный дамп/памп! Объем x20 за 15 сек.";
+            direction = if change_15s > 0.0 { "PUMP" } else { "DUMP" };
+            final_change = change_15s;
+        }
+        // Logic 2: Organic Breakout (Algo-trend)
+        // Volume rate 2m > 4x Background rate, Price > 2%
+        else {
+            let is_trend = if norm_2m > 0.0 { rate_2m > 4.0 * norm_2m } else { rate_2m > 0.0 };
             
-            // Если изменение > 0.5% и прошел кулдаун
-            if change_pct.abs() > 0.005 && now.duration_since(state.last_alert) > cooldown {
-                triggered = true;
-                direction = if change_pct > 0.0 { "PUMP" } else { "DUMP" };
-                state.last_alert = now;
+            if is_trend && change_2m.abs() > 0.02 {
+                signal_type = "ORGANIC_TREND";
+                msg = "Плавный рост объемов. Алгоритмы в деле.";
+                direction = if change_2m > 0.0 { "PUMP" } else { "DUMP" };
+                final_change = change_2m;
             }
         }
 
-        if triggered {
+        if !signal_type.is_empty() {
+            state.cooldowns.insert(event.s.clone(), now_instant);
             momentum_data.push(json!({
                 "symbol": event.s,
+                "signal": signal_type,
+                "msg": msg,
                 "direction": direction,
                 "price": current_price,
-                "change_pct": change_pct * 100.0
+                "change_pct": final_change * 100.0
             }));
         }
     }
