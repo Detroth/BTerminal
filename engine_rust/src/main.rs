@@ -91,7 +91,13 @@ async fn main() {
             match connect_async(internal_url.clone()).await {
                 Ok((ws_stream, _)) => {
                     println!("Connected to Internal API");
-                    let (mut write, _) = ws_stream.split();
+                    let (mut write, mut read) = ws_stream.split();
+
+                    // Важно: запускаем задачу на чтение, чтобы обрабатывать PING/PONG и не разрывать соединение
+                    tokio::spawn(async move {
+                        while let Some(_) = read.next().await {}
+                    });
+
                     while let Some(msg) = rx.recv().await {
                         if let Err(e) = write.send(msg).await {
                             eprintln!("WS Send Error: {}. Reconnecting...", e);

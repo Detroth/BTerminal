@@ -12,7 +12,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 # --- TELEGRAM BOT SETUP ---
-API_TOKEN = "8475491805:AAHFUOPwmFlfPo3BGYCAv9tm2kB3XHI5pVA"  # Вставьте сюда токен от @BotFather
+API_TOKEN = "8315010888:AAF9W3z5R9UDw5dDcf8wlP5bOxARzW-Vpyw"  # Вставьте сюда токен от @BotFather
 
 # Инициализация бота и диспетчера
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -24,6 +24,7 @@ subscribed_users: Set[int] = set()
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     subscribed_users.add(message.chat.id)
+    print(f"✅ [BOT] Новый подписчик: {message.chat.id}")
     await message.answer("🚀 <b>Терминал запущен.</b>\nОжидаю сигналы с рынка...")
 
 @asynccontextmanager
@@ -86,6 +87,9 @@ async def internal_endpoint(websocket: WebSocket):
                 if not isinstance(items, list):
                     items = [items]
                 
+                # Лог для отладки: видим, что сигнал пришел
+                print(f"📩 [INTERNAL] Получен сигнал Momentum: {len(items)} шт.")
+
                 for item in items:
                     signal = item.get("signal")
                     symbol = item.get("symbol")
@@ -97,6 +101,9 @@ async def internal_endpoint(websocket: WebSocket):
                         text = f"📈 <b>Алго-тренд</b>\nНабирают позицию по {symbol}"
                     
                     if text:
+                        if not subscribed_users:
+                            print("⚠️ [BOT] Нет подписчиков для отправки уведомления! (Отправьте /start)")
+                        
                         for chat_id in subscribed_users:
                             try:
                                 await bot.send_message(chat_id=chat_id, text=text)
@@ -111,6 +118,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIR = os.path.join(BASE_DIR, "../frontend")
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+# Заглушка для Chrome DevTools, чтобы не было ошибки 404 в консоли
+@app.get("/.well-known/appspecific/com.chrome.devtools.json", include_in_schema=False)
+async def chrome_devtools():
+    return Response(status_code=204)
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():

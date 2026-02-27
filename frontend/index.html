@@ -35,10 +35,10 @@
             <div class="clock">14:32:05 UTC</div>
         </header>
 
-        <!-- Chart Widget -->
-        <section class="widget chart-widget">
+        <!-- Chart Panel -->
+        <section class="widget chart-widget" id="chart-panel">
             <div class="widget-header">
-                <span class="title">BTC/USD PERPETUAL FUTURES [1m]</span>
+                <h2 class="title" id="chart-title">BTC/USD PERPETUAL FUTURES [1m]</h2>
                 <div class="controls">
                     <span class="btn active">1m</span>
                     <span class="btn">4H</span>
@@ -55,45 +55,53 @@
             </div>
         </section>
 
-        <!-- Momentum Scanner Widget -->
-        <section class="widget scanner-widget">
-            <div class="widget-header">>> MOMENTUM SCANNER</div>
+        <!-- Momentum Scanner -->
+        <section class="widget scanner-widget" id="scanners-container">
+            <div class="widget-header"><span class="title">>> MOMENTUM SCANNER</span></div>
             <div class="table-wrapper">
                 <table>
                     <thead>
-                        <tr><th>TICKER</th><th class="text-right">PRICE</th><th class="text-right">VOL(24h)</th><th class="text-right">CHG%</th></tr>
+                        <tr><th>TICKER</th><th class="text-right">PRICE</th><th class="text-right">VOL</th><th class="text-right">CHG%</th></tr>
                     </thead>
                     <tbody>
-                        <tr><td>PEPE</td><td class="text-right">0.000082</td><td class="text-right">420M</td><td class="text-right up">+12.5%</td></tr>
-                        <tr><td>WIF</td><td class="text-right">3.24</td><td class="text-right">150M</td><td class="text-right up">+8.2%</td></tr>
-                        <tr><td>DOGE</td><td class="text-right">0.16</td><td class="text-right">800M</td><td class="text-right down">-1.2%</td></tr>
-                        <tr><td>ARB</td><td class="text-right">1.12</td><td class="text-right">50M</td><td class="text-right down">-3.4%</td></tr>
-                        <tr><td>RNDR</td><td class="text-right">10.50</td><td class="text-right">90M</td><td class="text-right up">+4.1%</td></tr>
-                        <tr><td>TIA</td><td class="text-right">11.20</td><td class="text-right">30M</td><td class="text-right down">-0.5%</td></tr>
+                        <!-- Populated by JS -->
                     </tbody>
                 </table>
             </div>
         </section>
 
-        <!-- Funding Arbitrage Widget -->
+        <!-- Funding Arbitrage -->
         <section class="widget funding-widget">
-            <div class="widget-header">>> FUNDING ARBITRAGE</div>
+            <div class="widget-header"><span class="title">>> FUNDING ARBITRAGE</span></div>
             <div class="table-wrapper">
                 <table>
                     <thead>
                         <tr><th>COIN</th><th class="text-right">SPREAD</th><th class="text-right">ACTION (L/S)</th></tr>
                     </thead>
                     <tbody>
-                        <tr><td>BTC-PERP</td><td>Binance</td><td class="text-right up">0.0100%</td><td class="text-right muted">0.0105%</td></tr>
-                        <tr><td>ETH-PERP</td><td>Bybit</td><td class="text-right up">0.0120%</td><td class="text-right muted">0.0090%</td></tr>
-                        <tr><td>SOL-PERP</td><td>OKX</td><td class="text-right down">-0.0200%</td><td class="text-right muted">-0.0150%</td></tr>
-                        <tr><td>ENA-PERP</td><td>HyperL</td><td class="text-right up">0.0450%</td><td class="text-right muted">0.0400%</td></tr>
-                        <tr><td>ORDI-PERP</td><td>Gate</td><td class="text-right up">0.0800%</td><td class="text-right muted">0.0750%</td></tr>
-                        <tr><td>TON-PERP</td><td>Bitget</td><td class="text-right up">0.0100%</td><td class="text-right muted">0.0100%</td></tr>
+                        <!-- Populated by JS -->
                     </tbody>
                 </table>
             </div>
         </section>
+
+        <!-- Footer -->
+        <footer id="app-footer">
+            <div id="connection-status" class="footer-left">
+                <div class="status-indicator">
+                    <div class="status-dot"></div>
+                    <span>SYSTEMS OPERATIONAL</span>
+                </div>
+                <span style="margin-left: 15px;">LATENCY: <span style="color: #22c55e;">12ms</span></span>
+            </div>
+            <div id="footer-links" class="footer-right">
+                <span>B-TERMINAL v1.0.4</span>
+                <div class="footer-links">
+                    <a href="https://t.me/YourBot" target="_blank">STATUS</a>
+                    <a href="https://github.com/YourRepo" target="_blank">DOCS</a>
+                </div>
+            </div>
+        </footer>
     </div>
     <script>
         const ws = new WebSocket("ws://localhost:8000/ws/market_data");
@@ -169,6 +177,8 @@
 
                 const span = document.createElement('span');
                 span.className = 'tick';
+                span.style.cursor = 'pointer';
+                span.onclick = () => switchChart(item.symbol);
                 
                 const formattedPrice = price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
                 const arrow = change >= 0 ? "▲" : "▼";
@@ -195,6 +205,8 @@
                     tbody.deleteRow(tbody.rows.length - 1);
                 }
 
+                row.onclick = () => switchChart(item.symbol);
+
                 const isPump = item.direction === 'PUMP';
                 const colorClass = isPump ? 'up' : 'down';
                 const sign = isPump ? '+' : '';
@@ -208,7 +220,7 @@
                 `;
 
                 const flashClass = isPump ? 'flash-green' : 'flash-red';
-                row.classList.add(flashClass);
+                row.classList.add('clickable-row', flashClass);
                 setTimeout(() => row.classList.remove(flashClass), 10000); // Подсветка 10 секунд
             });
         }
@@ -219,6 +231,8 @@
     
             data.forEach(item => {
                 const row = tbody.insertRow();
+                row.onclick = () => switchChart(item.coin + 'USDT');
+
                 const spread = (item.spread * 100).toFixed(4) + '%';
                 
                 // Формируем строку действия: Long Exch1 / Short Exch2
@@ -231,7 +245,7 @@
                 `;
                 
                 // Легкая подсветка всей строки при обновлении
-                row.classList.add('flash-green');
+                row.classList.add('clickable-row', 'flash-green');
                 setTimeout(() => row.classList.remove('flash-green'), 500);
             });
         }
@@ -239,49 +253,30 @@
         // --- CHART INITIALIZATION ---
         const chart = LightweightCharts.createChart(document.getElementById('tvchart'), {
             layout: {
-                background: { color: '#000000' },
-                textColor: '#d1d4dc',
+                background: { color: 'transparent' },
+                textColor: '#a1a1aa',
             },
             grid: {
-                vertLines: { visible: false },
-                horzLines: { visible: false },
+                vertLines: { color: '#18181b' },
+                horzLines: { color: '#18181b' },
             },
             timeScale: {
                 timeVisible: true,
                 secondsVisible: false,
+                borderColor: '#27272a',
+            },
+            rightPriceScale: {
+                borderColor: '#27272a',
             },
         });
 
         const candleSeries = chart.addCandlestickSeries({
-            upColor: '#00ff41',
-            downColor: '#ff3333',
+            upColor: '#22c55e',
+            downColor: '#ef4444',
             borderVisible: false,
-            wickUpColor: '#00ff41',
-            wickDownColor: '#ff3333',
+            wickUpColor: '#22c55e',
+            wickDownColor: '#ef4444',
         });
-
-        // Fetch historical data from Binance Futures API
-        async function fetchHistoricalData() {
-            try {
-                const response = await fetch('https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=100');
-                const data = await response.json();
-                const candles = data.map(d => ({
-                    time: d[0] / 1000,
-                    open: parseFloat(d[1]),
-                    high: parseFloat(d[2]),
-                    low: parseFloat(d[3]),
-                    close: parseFloat(d[4]),
-                }));
-                candleSeries.setData(candles);
-                
-                if (candles.length > 0) {
-                    document.getElementById('chart-price').innerText = candles[candles.length - 1].close.toFixed(2);
-                }
-            } catch (error) {
-                console.error('Error fetching historical data:', error);
-            }
-        }
-        fetchHistoricalData();
 
         // Resize observer
         new ResizeObserver(entries => {
@@ -290,22 +285,72 @@
             chart.applyOptions({ width: newRect.width, height: newRect.height });
         }).observe(document.getElementById('tvchart'));
 
-        // Real-time updates via Binance WebSocket
-        const binanceWs = new WebSocket('wss://fstream.binance.com/ws/btcusdt@kline_1m');
-        binanceWs.onmessage = function(event) {
-            const message = JSON.parse(event.data);
-            const k = message.k;
-            const price = parseFloat(k.c);
-            candleSeries.update({
-                time: k.t / 1000,
-                open: parseFloat(k.o),
-                high: parseFloat(k.h),
-                low: parseFloat(k.l),
-                close: price
-            });
+        // Global variables
+        let currentChartSymbol = 'BTCUSDT';
+        let binanceKlineWs = null;
+
+        async function switchChart(symbol) {
+            symbol = symbol.toUpperCase();
+            currentChartSymbol = symbol;
+    
+            // 1. Меняем заголовок в UI
+            const titleEl = document.getElementById('chart-title');
+            if(titleEl) titleEl.innerText = `${symbol} PERPETUAL [1m]`;
             
-            document.getElementById('chart-price').innerText = price.toFixed(2);
-        };
+            const overlayEl = document.querySelector('#chart-overlay > div:first-child');
+            if (overlayEl) overlayEl.innerHTML = `${symbol}.P <span style="color: #666; font-size: 11px; font-weight: normal;">Binance Futures</span>`;
+
+            document.getElementById('chart-price').innerText = '--';
+
+            // 2. Убиваем старый поток данных Binance
+            if (binanceKlineWs) {
+                binanceKlineWs.close();
+            }
+
+            try {
+                // 3. Скачиваем исторические свечи (последние 100 минут)
+                const response = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=150`);
+                const data = await response.json();
+        
+                // 4. Парсим данные в формат TradingView
+                const formattedData = data.map(k => ({
+                    time: Math.floor(k[0] / 1000), // Обязательно в секундах
+                    open: parseFloat(k[1]),
+                    high: parseFloat(k[2]),
+                    low: parseFloat(k[3]),
+                    close: parseFloat(k[4])
+                }));
+
+                // 5. Загружаем историю в график (заменяя старую монету)
+                candleSeries.setData(formattedData);
+                
+                if (formattedData.length > 0) {
+                    document.getElementById('chart-price').innerText = formattedData[formattedData.length - 1].close.toFixed(2);
+                }
+
+                // 6. Открываем новый WebSocket для живой цены
+                binanceKlineWs = new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}@kline_1m`);
+        
+                binanceKlineWs.onmessage = (event) => {
+                    const message = JSON.parse(event.data);
+                    const k = message.k;
+                    // Обновляем текущую (правую) свечу
+                    candleSeries.update({
+                        time: Math.floor(k.t / 1000),
+                        open: parseFloat(k.o),
+                        high: parseFloat(k.h),
+                        low: parseFloat(k.l),
+                        close: parseFloat(k.c)
+                    });
+                    document.getElementById('chart-price').innerText = parseFloat(k.c).toFixed(2);
+                };
+            } catch (err) {
+                console.error("Ошибка загрузки графика:", err);
+            }   
+        }
+
+        // Initial Load
+        switchChart('BTCUSDT');
     </script>
 </body>
 </html>
