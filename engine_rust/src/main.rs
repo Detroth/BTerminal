@@ -1,7 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, HashSet};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -56,18 +56,6 @@ struct OkxTicker {
     inst_id: String,
     #[serde(rename = "fundingRate")]
     funding_rate: String,
-}
-
-struct TickData {
-    price: f64,
-    volume: f64,
-    raw_q: f64,
-    timestamp: u64,
-}
-
-struct ScannerState {
-    history: HashMap<String, VecDeque<TickData>>,
-    cooldowns: HashMap<String, Instant>,
 }
 
 #[tokio::main]
@@ -130,14 +118,11 @@ async fn main() {
         }
     });
 
+    // Задача 3: MEXC CVD Scanner (HFT Exhaustion/Absorption)
+    tokio::spawn(mexc_cvd_scanner(tx.clone()));
+
     // Разделяем поток на чтение и запись (хотя писать мы пока не будем)
     let (_, mut read) = ws_stream.split();
-
-    // Хранилище состояний: Symbol -> Last Reference Price
-    let mut scanner_state = ScannerState {
-        history: HashMap::new(),
-        cooldowns: HashMap::new(),
-    };
 
     while let Some(message) = read.next().await {
         match message {
@@ -155,13 +140,6 @@ async fn main() {
                             let tape_msg = process_ticker_tape(&usdt_events);
                             if let Err(e) = tx.send(Message::Text(tape_msg.to_string())) {
                                 eprintln!("Failed to send tape: {}", e);
-                            }
-
-                            // 2. Momentum Scanner
-                            if let Some(mom_msg) = process_momentum(&usdt_events, &mut scanner_state) {
-                                if let Err(e) = tx.send(Message::Text(mom_msg.to_string())) {
-                                    eprintln!("Failed to send momentum: {}", e);
-                                }
                             }
                         }
                         Err(e) => eprintln!("JSON parsing error: {}", e),
@@ -194,142 +172,6 @@ fn process_ticker_tape(events: &[TickerEvent]) -> serde_json::Value {
         "type": "ticker_tape",
         "data": top_15
     })
-}
-
-fn process_momentum(events: &[TickerEvent], state: &mut ScannerState) -> Option<serde_json::Value> {
-    let mut momentum_data = Vec::new();
-    let now_instant = Instant::now();
-    let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-    
-    let window_5m = 5 * 60 * 1000;   // 5 minutes in ms
-    let window_2m = 2 * 60 * 1000;   // 2 minutes in ms
-    let window_15s = 15 * 1000;      // 15 seconds in ms
-    let cooldown_duration = Duration::from_secs(15 * 60); // 15 minutes cooldown
-
-    for event in events {
-        let current_price = event.c.parse::<f64>().unwrap_or(0.0);
-        let current_q = event.q.parse::<f64>().unwrap_or(0.0);
-        
-        let history = state.history.entry(event.s.clone()).or_insert_with(VecDeque::new);
-        
-        // 1. Calculate Volume Delta
-        let mut vol_delta = 0.0;
-        if let Some(last_tick) = history.back() {
-            vol_delta = current_q - last_tick.raw_q;
-            if vol_delta < 0.0 { vol_delta = 0.0; } // Reset or anomaly
-        }
-
-        // 2. Add Tick
-        history.push_back(TickData {
-            price: current_price,
-            volume: vol_delta,
-            raw_q: current_q,
-            timestamp: now_ts,
-        });
-
-        // 3. Prune old ticks (> 5 mins)
-        while let Some(tick) = history.front() {
-            if now_ts - tick.timestamp > window_5m {
-                history.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        // 4. Check Cooldown
-        if let Some(last_alert) = state.cooldowns.get(&event.s) {
-            if now_instant.duration_since(*last_alert) < cooldown_duration {
-                continue;
-            }
-        }
-        
-        // 5. Calculate Metrics
-        let mut vol_15s = 0.0;
-        let mut vol_2m = 0.0;
-        let mut vol_5m = 0.0;
-
-        for tick in history.iter() {
-            let age = now_ts - tick.timestamp;
-            if age <= window_5m { vol_5m += tick.volume; }
-            if age <= window_2m { vol_2m += tick.volume; }
-            if age <= window_15s { vol_15s += tick.volume; }
-        }
-
-        // Find reference prices
-        let target_15s = now_ts.saturating_sub(window_15s);
-        let target_2m = now_ts.saturating_sub(window_2m);
-        
-        let get_price_at = |target: u64| -> f64 {
-            history.iter()
-                .min_by_key(|t| (t.timestamp as i64 - target as i64).abs())
-                .map(|t| t.price)
-                .unwrap_or(current_price)
-        };
-
-        let price_15s_ago = get_price_at(target_15s);
-        let price_2m_ago = get_price_at(target_2m);
-
-        let change_15s = if price_15s_ago > 0.0 { (current_price - price_15s_ago) / price_15s_ago } else { 0.0 };
-        let change_2m = if price_2m_ago > 0.0 { (current_price - price_2m_ago) / price_2m_ago } else { 0.0 };
-
-        // Calculate Rates (Volume per second)
-        let rate_15s = vol_15s / 15.0;
-        let rate_2m = vol_2m / 120.0;
-        
-        // Calculate Norms (Average rate of the REST of the 5m window)
-        // This compares current burst against background noise
-        let norm_15s = if vol_5m > vol_15s { (vol_5m - vol_15s) / (300.0 - 15.0) } else { 0.0 };
-        let norm_2m = if vol_5m > vol_2m { (vol_5m - vol_2m) / (300.0 - 120.0) } else { 0.0 };
-
-        let mut signal_type = "";
-        let mut msg = "";
-        let mut direction = "NEUTRAL";
-        let mut final_change = 0.0;
-
-        // Logic 1: Manipulation (Micro-burst)
-        // Volume rate 15s > 20x Background rate, Price > 1.5%
-        let is_manipulation = if norm_15s > 0.0 { rate_15s > 20.0 * norm_15s } else { rate_15s > 0.0 };
-        
-        if is_manipulation && change_15s.abs() > 0.015 {
-            signal_type = "MANIPULATION";
-            msg = "Искусственный дамп/памп! Объем x20 за 15 сек.";
-            direction = if change_15s > 0.0 { "PUMP" } else { "DUMP" };
-            final_change = change_15s;
-        }
-        // Logic 2: Organic Breakout (Algo-trend)
-        // Volume rate 2m > 4x Background rate, Price > 2%
-        else {
-            let is_trend = if norm_2m > 0.0 { rate_2m > 4.0 * norm_2m } else { rate_2m > 0.0 };
-            
-            if is_trend && change_2m.abs() > 0.02 {
-                signal_type = "ORGANIC_TREND";
-                msg = "Плавный рост объемов. Алгоритмы в деле.";
-                direction = if change_2m > 0.0 { "PUMP" } else { "DUMP" };
-                final_change = change_2m;
-            }
-        }
-
-        if !signal_type.is_empty() {
-            state.cooldowns.insert(event.s.clone(), now_instant);
-            momentum_data.push(json!({
-                "symbol": event.s,
-                "signal": signal_type,
-                "msg": msg,
-                "direction": direction,
-                "price": current_price,
-                "change_pct": final_change * 100.0
-            }));
-        }
-    }
-
-    if momentum_data.is_empty() {
-        None
-    } else {
-        Some(json!({
-            "type": "momentum",
-            "data": momentum_data
-        }))
-    }
 }
 
 // Логика сбора и анализа ставок финансирования
@@ -455,4 +297,257 @@ async fn fetch_and_send_funding(
     tx.send(Message::Text(msg.to_string()))?;
 
     Ok(())
+}
+
+// --- MEXC SCANNER MODULE ---
+
+#[derive(Deserialize)]
+struct MexcTickerResponse {
+    success: bool,
+    data: Vec<MexcTicker>,
+}
+
+#[derive(Deserialize)]
+struct MexcTicker {
+    symbol: String,
+    #[serde(rename = "lastPrice")]
+    last_price: f64,
+    #[serde(rename = "amount24")]
+    amount_24: f64,
+}
+
+#[derive(Deserialize)]
+struct MexcResponse {
+    channel: Option<String>,
+    symbol: Option<String>,
+    data: Option<MexcData>,
+}
+
+#[derive(Deserialize)]
+struct MexcData {
+    p: f64,
+    v: f64,
+    #[serde(rename = "T")]
+    side: i32, // 1: Buy, 2: Sell
+    t: u64,
+}
+
+struct MexcTick {
+    price: f64,
+    volume: f64,
+    side: i32,
+    timestamp: u64,
+}
+
+struct MexcScannerState {
+    history: HashMap<String, VecDeque<MexcTick>>,
+    cooldowns: HashMap<String, Instant>,
+    avg_vol: HashMap<String, f64>, // Скользящая средняя объема за 60 сек
+}
+
+async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
+    let connect_addr = "wss://contract.mexc.com/edge";
+    let url = Url::parse(connect_addr).expect("Bad MEXC URL");
+    let http_client = reqwest::Client::new();
+    
+    println!("Connecting to MEXC Futures Scanner: {}", connect_addr);
+
+    loop {
+        match connect_async(url.clone()).await {
+            Ok((mut ws_stream, _)) => {
+                println!("Connected to MEXC WebSocket");
+                
+                let (mut ws_write, mut ws_read) = ws_stream.split();
+                
+                // Channels for internal communication
+                let (ws_msg_tx, mut ws_msg_rx) = mpsc::unbounded_channel::<Message>();
+                let (sniper_tx, mut sniper_rx) = mpsc::unbounded_channel::<String>();
+
+                // Task: WebSocket Writer
+                tokio::spawn(async move {
+                    while let Some(msg) = ws_msg_rx.recv().await {
+                        if ws_write.send(msg).await.is_err() { break; }
+                    }
+                });
+
+                // Task: Hunter (Global Radar) - 3s Loop
+                let http_client_clone = http_client.clone();
+                let global_tx = tx.clone();
+                
+                tokio::spawn(async move {
+                    let mut prev_state: HashMap<String, (f64, f64)> = HashMap::new(); // Symbol -> (Price, Vol)
+                    
+                    loop {
+                        let url = "https://contract.mexc.com/api/v1/contract/ticker";
+                        if let Ok(resp) = http_client_clone.get(url).send().await {
+                            if let Ok(json) = resp.json::<MexcTickerResponse>().await {
+                                if json.success {
+                                    for t in json.data {
+                                        if t.symbol == "BTC_USDT" || t.symbol == "ETH_USDT" { continue; }
+                                        
+                                        // Базовый фильтр ликвидности
+                                        if t.amount_24 < 50_000.0 { continue; }
+
+                                        if let Some((old_price, old_vol)) = prev_state.get(&t.symbol) {
+                                            let pct_change = (t.last_price - old_price) / old_price;
+                                            let volume_delta = t.amount_24 - old_vol;
+                                            
+                                            // Игнорируем отрицательную дельту (сброс суток)
+                                            if volume_delta >= 0.0 {
+                                                // Условие Вспышки: Влили > $15k И Цена сдвинулась > 1.2%
+                                                if volume_delta > 15_000.0 && pct_change.abs() > 0.012 {
+                                                    let msg = json!({
+                                                        "type": "momentum",
+                                                        "data": [{
+                                                            "symbol": t.symbol,
+                                                            "signal": "SUDDEN_BREAKOUT",
+                                                            "change_pct": pct_change * 100.0,
+                                                            "msg": format!("Вспышка! ${:.0} за 3с, Изм: {:.2}%", volume_delta, pct_change * 100.0)
+                                                        }]
+                                                    });
+                                                    let _ = global_tx.send(Message::Text(msg.to_string()));
+                                                    let _ = sniper_tx.send(t.symbol.clone());
+                                                }
+                                            }
+                                        }
+                                        prev_state.insert(t.symbol, (t.last_price, t.amount_24));
+                                    }
+                                }
+                            }
+                        }
+                        sleep(Duration::from_secs(3)).await;
+                    }
+                });
+
+                // Main Loop: Reader & Processor
+                let mut state = MexcScannerState {
+                    history: HashMap::new(),
+                    cooldowns: HashMap::new(),
+                    avg_vol: HashMap::new(),
+                };
+                
+                let mut active_subs: VecDeque<String> = VecDeque::new();
+                let mut subscribed_set: HashSet<String> = HashSet::new();
+                
+                let ws_msg_tx_pong = ws_msg_tx.clone();
+
+                loop {
+                    tokio::select! {
+                        Some(msg) = ws_read.next() => {
+                            match msg {
+                                Ok(Message::Text(text)) => {
+                                    if text.contains("ping") {
+                                        let _ = ws_msg_tx_pong.send(Message::Text(json!({"method": "pong"}).to_string()));
+                                        continue;
+                                    }
+                                    if let Ok(event) = serde_json::from_str::<MexcResponse>(&text) {
+                                        if let (Some(symbol), Some(data)) = (event.symbol, event.data) {
+                                            process_mexc_tick(&symbol, data, &mut state, &tx).await;
+                                        }
+                                    }
+                                }
+                                Ok(_) => {},
+                                Err(_) => break,
+                            }
+                        }
+                        Some(target) = sniper_rx.recv() => {
+                            if !subscribed_set.contains(&target) {
+                                // Evict if full (Max 20)
+                                if active_subs.len() >= 20 {
+                                    if let Some(old) = active_subs.pop_front() {
+                                        subscribed_set.remove(&old);
+                                        let msg = json!({ "method": "unsub.deal", "param": { "symbol": old } });
+                                        let _ = ws_msg_tx_pong.send(Message::Text(msg.to_string()));
+                                        
+                                        // Clean state
+                                        state.history.remove(&old);
+                                        state.cooldowns.remove(&old);
+                                        state.avg_vol.remove(&old);
+                                        println!("MEXC Killer: Dropped cold target {}", old);
+                                    }
+                                }
+                                
+                                // Add new target
+                                active_subs.push_back(target.clone());
+                                subscribed_set.insert(target.clone());
+                                let msg = json!({ "method": "sub.deal", "param": { "symbol": target } });
+                                let _ = ws_msg_tx_pong.send(Message::Text(msg.to_string()));
+                                println!("MEXC Killer: Locked on target {}", target);
+                            }
+                        }
+                        else => break,
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("MEXC Connect Error: {}. Retrying in 5s...", e);
+                sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn process_mexc_tick(symbol: &str, data: MexcData, state: &mut MexcScannerState, tx: &mpsc::UnboundedSender<Message>) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+    let history = state.history.entry(symbol.to_string()).or_default();
+    
+    history.push_back(MexcTick { price: data.p, volume: data.v, side: data.side, timestamp: now });
+
+    // Окно 60 секунд
+    while let Some(tick) = history.front() {
+        if now - tick.timestamp > 60_000 { history.pop_front(); } else { break; }
+    }
+
+    if history.len() < 10 { return; } // Накопление данных
+
+    // Кулдаун 15 минут
+    if let Some(last) = state.cooldowns.get(symbol) {
+        if Instant::now().duration_since(*last) < Duration::from_secs(15 * 60) { return; }
+    }
+
+    // Расчет метрик
+    let start_price = history.front().unwrap().price;
+    let end_price = history.back().unwrap().price;
+    let price_change_pct = (end_price - start_price) / start_price;
+
+    let (mut buy_vol, mut sell_vol) = (0.0, 0.0);
+    for t in history.iter() { if t.side == 1 { buy_vol += t.volume; } else { sell_vol += t.volume; } }
+    
+    let total_vol = buy_vol + sell_vol;
+    let delta = buy_vol - sell_vol;
+
+    // Обновляем средний объем (экспоненциальное сглаживание)
+    let avg = state.avg_vol.entry(symbol.to_string()).or_insert(total_vol);
+    *avg = *avg * 0.99 + total_vol * 0.01;
+    if *avg < 10.0 { return; } // Фильтр шума
+
+    let mut signal = "";
+    // Сигнал 1: Памп/Дамп (Объем x5, Цена > 2%)
+    if total_vol > 5.0 * *avg && price_change_pct.abs() > 0.02 {
+        signal = if price_change_pct > 0.0 { "MEXC_PUMP" } else { "MEXC_DUMP" };
+    }
+    // Сигнал 2: Истощение (Buy Vol x5, Delta > 0, Цена стоит)
+    else if buy_vol > 5.0 * (*avg / 2.0) && delta > 0.0 && price_change_pct.abs() < 0.002 {
+        signal = "EXHAUSTION_SHORT";
+    }
+    // Сигнал 3: Поглощение (Sell Vol x5, Delta < 0, Цена стоит)
+    else if sell_vol > 5.0 * (*avg / 2.0) && delta < 0.0 && price_change_pct.abs() < 0.002 {
+        signal = "ABSORPTION_LONG";
+    }
+
+    if !signal.is_empty() {
+        state.cooldowns.insert(symbol.to_string(), Instant::now());
+        let msg = json!({
+            "type": "momentum", // Используем тип momentum для совместимости с Python
+            "data": [{
+                "symbol": symbol,
+                "signal": signal,
+                "price": end_price,
+                "change_pct": price_change_pct * 100.0,
+                "msg": format!("MEXC HFT: {} (Vol x{:.1})", signal, total_vol / *avg)
+            }]
+        });
+        let _ = tx.send(Message::Text(msg.to_string()));
+        println!("🔥 MEXC Signal: {} on {}", signal, symbol);
+    }
 }

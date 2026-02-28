@@ -12,7 +12,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 # --- TELEGRAM BOT SETUP ---
-API_TOKEN = "8315010888:AAF9W3z5R9UDw5dDcf8wlP5bOxARzW-Vpyw"  # Вставьте сюда токен от @BotFather
+API_TOKEN = "8475491805:AAHFUOPwmFlfPo3BGYCAv9tm2kB3XHI5pVA"  # Вставьте сюда токен от @BotFather
 
 # Инициализация бота и диспетчера
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -72,6 +72,17 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
+async def send_telegram_alert(text: str):
+    if not subscribed_users:
+        print("⚠️ [BOT] Нет подписчиков для отправки уведомления! (Отправьте /start)")
+        return
+
+    for chat_id in subscribed_users:
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            print(f"Failed to send TG message: {e}")
+
 # Внутренний WebSocket для Rust-движка
 @app.websocket("/ws/internal")
 async def internal_endpoint(websocket: WebSocket):
@@ -93,22 +104,24 @@ async def internal_endpoint(websocket: WebSocket):
                 for item in items:
                     signal = item.get("signal")
                     symbol = item.get("symbol")
+                    change = item.get("change_pct", 0)
                     
                     text = ""
                     if signal == "MANIPULATION":
                         text = f"🚨 <b>ВНИМАНИЕ: МАНИПУЛЯЦИЯ!</b>\nВозможен Pump&Dump по {symbol}!"
                     elif signal == "ORGANIC_TREND":
                         text = f"📈 <b>Алго-тренд</b>\nНабирают позицию по {symbol}"
+                    elif signal == "MEXC_PUMP":
+                        text = f"<b>🚀 РАЗГОН (MEXC): {symbol}</b>\nАгрессивные покупки! Изменение: {change:.2f}%"
+                    elif signal == "EXHAUSTION_SHORT":
+                        text = f"<b>🔴 ТОЧКА ИСТОЩЕНИЯ (ШОРТ)</b>\nПара: {symbol} (MEXC)\nДетали: Огромная Buy-дельта, но цена зажата в лимитки. Покупатель выдохся. Идеальная зона для контр-сделки!"
+                    elif signal == "ABSORPTION_LONG":
+                        text = f"<b>🟢 АБСОРБЦИЯ (ЛОНГ)</b>\nПара: {symbol} (MEXC)\nДетали: Давление продавцов впитано лимитками покупателя. Цена не падает. Готовимся к отскоку!"
+                    elif signal == "SUDDEN_BREAKOUT":
+                        text = f"<b>⚡️ ВСПЫШКА АКТИВНОСТИ</b>\nПара: {symbol} (MEXC)\nМертвая монета проснулась! Движок начал анализ CVD. Ждем точку входа..."
                     
                     if text:
-                        if not subscribed_users:
-                            print("⚠️ [BOT] Нет подписчиков для отправки уведомления! (Отправьте /start)")
-                        
-                        for chat_id in subscribed_users:
-                            try:
-                                await bot.send_message(chat_id=chat_id, text=text)
-                            except Exception as e:
-                                print(f"Failed to send TG message: {e}")
+                        asyncio.create_task(send_telegram_alert(text))
     except Exception as e:
         print(f"Internal engine disconnected: {e}")
 
