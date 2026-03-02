@@ -107,18 +107,16 @@ async def internal_endpoint(websocket: WebSocket):
                     change = item.get("change_pct", 0)
                     
                     text = ""
-                    if signal == "MANIPULATION":
-                        text = f"🚨 <b>ВНИМАНИЕ: МАНИПУЛЯЦИЯ!</b>\nВозможен Pump&Dump по {symbol}!"
-                    elif signal == "ORGANIC_TREND":
-                        text = f"📈 <b>Алго-тренд</b>\nНабирают позицию по {symbol}"
-                    elif signal == "MEXC_PUMP":
-                        text = f"<b>🚀 РАЗГОН (MEXC): {symbol}</b>\nАгрессивные покупки! Изменение: {change:.2f}%"
-                    elif signal == "EXHAUSTION_SHORT":
-                        text = f"<b>🔴 ТОЧКА ИСТОЩЕНИЯ (ШОРТ)</b>\nПара: {symbol} (MEXC)\nДетали: Огромная Buy-дельта, но цена зажата в лимитки. Покупатель выдохся. Идеальная зона для контр-сделки!"
-                    elif signal == "ABSORPTION_LONG":
-                        text = f"<b>🟢 АБСОРБЦИЯ (ЛОНГ)</b>\nПара: {symbol} (MEXC)\nДетали: Давление продавцов впитано лимитками покупателя. Цена не падает. Готовимся к отскоку!"
-                    elif signal == "SUDDEN_BREAKOUT":
-                        text = f"<b>⚡️ ВСПЫШКА АКТИВНОСТИ</b>\nПара: {symbol} (MEXC)\nМертвая монета проснулась! Движок начал анализ CVD. Ждем точку входа..."
+                    if signal == "MACRO_PUMP":
+                        text = f"<b>🟢 ЗАРОЖДЕНИЕ ТРЕНДА (15m)</b>\nПара: #{symbol}\nДетали: Аномальный рост объемов (x10) и цены. Крупный игрок набирает позицию."
+                    elif signal == "EXHAUSTION":
+                        text = f"<b>🔴 ИСТОЩЕНИЕ ПОКУПАТЕЛЯ (3m)</b>\nПара: #{symbol}\nДетали: Огромный объем сдерживается лимитными ордерами. Цена остановилась. Приготовиться к контр-сделке (Short) или закрытию лонга!"
+                    elif signal == "ALGO_REVERSION":
+                        price = item.get("price", 0)
+                        high = item.get("high", 0)
+                        tp = item.get("tp", 0)
+                        sl = item.get("sl", 0)
+                        text = f"<b>🤖 АЛГОРИТМИЧЕСКИЙ ОТКАТ (ШОРТ)</b>\nПара: #{symbol}\nТекущая цена: {price:.5f}\n──────────────\n🔴 <b>Stop Loss:</b> {sl:.5f} (за хай {high:.5f})\n🟢 <b>Take Profit:</b> {tp:.5f} (50% коррекции)\n──────────────\nЛогика: Органический рост завершен, алгоритмы возвращают цену в зону баланса. Заходим со стопом!"
                     
                     if text:
                         asyncio.create_task(send_telegram_alert(text))

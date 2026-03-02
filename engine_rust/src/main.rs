@@ -314,6 +314,8 @@ struct MexcTicker {
     last_price: f64,
     #[serde(rename = "amount24")]
     amount_24: f64,
+    #[serde(rename = "riseFallRate")]
+    rise_fall_rate: f64,
 }
 
 #[derive(Deserialize)]
@@ -332,17 +334,25 @@ struct MexcData {
     t: u64,
 }
 
-struct MexcTick {
-    price: f64,
+#[derive(Debug, Clone)]
+struct TickData {
+    timestamp: u64, // Minute timestamp (Unix ms / 60000)
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
     volume: f64,
-    side: i32,
-    timestamp: u64,
 }
 
 struct MexcScannerState {
-    history: HashMap<String, VecDeque<MexcTick>>,
-    cooldowns: HashMap<String, Instant>,
-    avg_vol: HashMap<String, f64>, // Скользящая средняя объема за 60 сек
+    history: HashMap<String, VecDeque<TickData>>,
+    current_candles: HashMap<String, TickData>,
+    cooldowns: HashMap<(String, String), Instant>,
+    daily_changes: HashMap<String, f64>,
+}
+
+enum ScannerControl {
+    MarketUpdate { targets: Vec<String>, daily_changes: HashMap<String, f64> },
 }
 
 async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
@@ -361,7 +371,7 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                 
                 // Channels for internal communication
                 let (ws_msg_tx, mut ws_msg_rx) = mpsc::unbounded_channel::<Message>();
-                let (sniper_tx, mut sniper_rx) = mpsc::unbounded_channel::<String>();
+                let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ScannerControl>();
 
                 // Task: WebSocket Writer
                 tokio::spawn(async move {
@@ -370,66 +380,64 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                     }
                 });
 
-                // Task: Hunter (Global Radar) - 3s Loop
+                // Task: Hunter (Global Radar) - 10s Loop (Less aggressive than 3s, focus on analysis)
                 let http_client_clone = http_client.clone();
-                let global_tx = tx.clone();
                 
                 tokio::spawn(async move {
-                    let mut prev_state: HashMap<String, (f64, f64)> = HashMap::new(); // Symbol -> (Price, Vol)
-                    
                     loop {
                         let url = "https://contract.mexc.com/api/v1/contract/ticker";
                         if let Ok(resp) = http_client_clone.get(url).send().await {
                             if let Ok(json) = resp.json::<MexcTickerResponse>().await {
                                 if json.success {
-                                    for t in json.data {
-                                        if t.symbol == "BTC_USDT" || t.symbol == "ETH_USDT" { continue; }
-                                        
-                                        // Базовый фильтр ликвидности
-                                        if t.amount_24 < 50_000.0 { continue; }
-
-                                        if let Some((old_price, old_vol)) = prev_state.get(&t.symbol) {
-                                            let pct_change = (t.last_price - old_price) / old_price;
-                                            let volume_delta = t.amount_24 - old_vol;
-                                            
-                                            // Игнорируем отрицательную дельту (сброс суток)
-                                            if volume_delta >= 0.0 {
-                                                // Условие Вспышки: Влили > $15k И Цена сдвинулась > 1.2%
-                                                if volume_delta > 15_000.0 && pct_change.abs() > 0.012 {
-                                                    let msg = json!({
-                                                        "type": "momentum",
-                                                        "data": [{
-                                                            "symbol": t.symbol,
-                                                            "signal": "SUDDEN_BREAKOUT",
-                                                            "change_pct": pct_change * 100.0,
-                                                            "msg": format!("Вспышка! ${:.0} за 3с, Изм: {:.2}%", volume_delta, pct_change * 100.0)
-                                                        }]
-                                                    });
-                                                    let _ = global_tx.send(Message::Text(msg.to_string()));
-                                                    let _ = sniper_tx.send(t.symbol.clone());
-                                                }
-                                            }
-                                        }
-                                        prev_state.insert(t.symbol, (t.last_price, t.amount_24));
+                                    let mut targets = Vec::new();
+                                    let mut daily_map = HashMap::new();
+                                    
+                                    // Filter liquid pairs
+                                    let mut tickers = json.data;
+                                    tickers.retain(|t| t.amount_24 >= 50_000.0 && t.symbol != "BTC_USDT" && t.symbol != "ETH_USDT");
+                                    tickers.sort_by(|a, b| b.amount_24.partial_cmp(&a.amount_24).unwrap_or(std::cmp::Ordering::Equal));
+                                    
+                                    // Populate daily_map from tickers (before filtering/taking top 40 if needed, or just from filtered)
+                                    // Since we moved json.data to tickers, we iterate tickers.
+                                    for t in &tickers {
+                                        daily_map.insert(t.symbol.clone(), t.rise_fall_rate);
                                     }
+                                    
+                                    for t in tickers.iter().take(40) {
+                                        targets.push(t.symbol.clone());
+                                    }
+
+                                    let _ = ctrl_tx.send(ScannerControl::MarketUpdate { 
+                                        targets, 
+                                        daily_changes: daily_map 
+                                    });
                                 }
                             }
                         }
-                        sleep(Duration::from_secs(3)).await;
+                        sleep(Duration::from_secs(10)).await;
                     }
                 });
 
                 // Main Loop: Reader & Processor
                 let mut state = MexcScannerState {
                     history: HashMap::new(),
+                    current_candles: HashMap::new(),
                     cooldowns: HashMap::new(),
-                    avg_vol: HashMap::new(),
+                    daily_changes: HashMap::new(),
                 };
                 
-                let mut active_subs: VecDeque<String> = VecDeque::new();
                 let mut subscribed_set: HashSet<String> = HashSet::new();
                 
                 let ws_msg_tx_pong = ws_msg_tx.clone();
+
+                // PING task to keep connection alive
+                let ws_msg_tx_ping = ws_msg_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        sleep(Duration::from_secs(20)).await;
+                        let _ = ws_msg_tx_ping.send(Message::Text(json!({"method": "ping"}).to_string()));
+                    }
+                });
 
                 loop {
                     tokio::select! {
@@ -442,7 +450,7 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                     }
                                     if let Ok(event) = serde_json::from_str::<MexcResponse>(&text) {
                                         if let (Some(symbol), Some(data)) = (event.symbol, event.data) {
-                                            process_mexc_tick(&symbol, data, &mut state, &tx).await;
+                                            process_mexc_candle(&symbol, data, &mut state, &tx).await;
                                         }
                                     }
                                 }
@@ -450,29 +458,37 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                 Err(_) => break,
                             }
                         }
-                        Some(target) = sniper_rx.recv() => {
-                            if !subscribed_set.contains(&target) {
-                                // Evict if full (Max 20)
-                                if active_subs.len() >= 20 {
-                                    if let Some(old) = active_subs.pop_front() {
-                                        subscribed_set.remove(&old);
-                                        let msg = json!({ "method": "unsub.deal", "param": { "symbol": old } });
+                        Some(ctrl) = ctrl_rx.recv() => {
+                            match ctrl {
+                                ScannerControl::MarketUpdate { targets, daily_changes } => {
+                                    state.daily_changes = daily_changes;
+                                    let new_set: HashSet<String> = targets.into_iter().collect();
+                                    
+                                    // Subscribe new
+                                    for pair in &new_set {
+                                        if !subscribed_set.contains(pair) {
+                                            let msg = json!({ "method": "sub.deal", "param": { "symbol": pair } });
+                                            let _ = ws_msg_tx_pong.send(Message::Text(msg.to_string()));
+                                            println!("MEXC Subscribing: {}", pair);
+                                        }
+                                    }
+                                    
+                                    // Unsubscribe old
+                                    let to_remove: Vec<String> = subscribed_set.iter()
+                                        .filter(|p| !new_set.contains(*p))
+                                        .cloned()
+                                        .collect();
+                                        
+                                    for pair in to_remove {
+                                        let msg = json!({ "method": "unsub.deal", "param": { "symbol": pair } });
                                         let _ = ws_msg_tx_pong.send(Message::Text(msg.to_string()));
                                         
-                                        // Clean state
-                                        state.history.remove(&old);
-                                        state.cooldowns.remove(&old);
-                                        state.avg_vol.remove(&old);
-                                        println!("MEXC Killer: Dropped cold target {}", old);
+                                        state.history.remove(&pair);
+                                        state.current_candles.remove(&pair);
                                     }
+                                    
+                                    subscribed_set = new_set;
                                 }
-                                
-                                // Add new target
-                                active_subs.push_back(target.clone());
-                                subscribed_set.insert(target.clone());
-                                let msg = json!({ "method": "sub.deal", "param": { "symbol": target } });
-                                let _ = ws_msg_tx_pong.send(Message::Text(msg.to_string()));
-                                println!("MEXC Killer: Locked on target {}", target);
                             }
                         }
                         else => break,
@@ -487,67 +503,103 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
     }
 }
 
-async fn process_mexc_tick(symbol: &str, data: MexcData, state: &mut MexcScannerState, tx: &mpsc::UnboundedSender<Message>) {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-    let history = state.history.entry(symbol.to_string()).or_default();
+async fn process_mexc_candle(symbol: &str, data: MexcData, state: &mut MexcScannerState, tx: &mpsc::UnboundedSender<Message>) {
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+    let current_minute = now_ms / 60_000;
+
+    let candle = state.current_candles.entry(symbol.to_string()).or_insert(TickData {
+        timestamp: current_minute,
+        open: data.p,
+        high: data.p,
+        low: data.p,
+        close: data.p,
+        volume: 0.0,
+    });
+
+    if candle.timestamp != current_minute {
+        let finalized_candle = candle.clone();
+        
+        let history = state.history.entry(symbol.to_string()).or_default();
+        history.push_back(finalized_candle);
+        if history.len() > 30 { history.pop_front(); }
+
+        analyze_history(symbol, history, &mut state.cooldowns, tx).await;
+
+        *candle = TickData {
+            timestamp: current_minute,
+            open: data.p,
+            high: data.p,
+            low: data.p,
+            close: data.p,
+            volume: 0.0,
+        };
+    }
+
+    if data.p > candle.high { candle.high = data.p; }
+    if data.p < candle.low { candle.low = data.p; }
+    candle.close = data.p;
+    candle.volume += data.v;
+}
+
+async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: &mut HashMap<(String, String), Instant>, tx: &mpsc::UnboundedSender<Message>) {
+    if history.len() < 15 { return; }
+
+    let now_instant = Instant::now();
     
-    history.push_back(MexcTick { price: data.p, volume: data.v, side: data.side, timestamp: now });
+    // ALGO REVERSION Logic
+    let start_idx = history.len().saturating_sub(15);
+    let window_iter = history.iter().skip(start_idx);
 
-    // Окно 60 секунд
-    while let Some(tick) = history.front() {
-        if now - tick.timestamp > 60_000 { history.pop_front(); } else { break; }
+    let mut min_price = f64::MAX;
+    let mut max_price = f64::MIN;
+    let mut min_time = 0;
+    let mut max_time = 0;
+
+    for candle in window_iter {
+        if candle.low < min_price {
+            min_price = candle.low;
+            min_time = candle.timestamp;
+        }
+        if candle.high > max_price {
+            max_price = candle.high;
+            max_time = candle.timestamp;
+        }
     }
 
-    if history.len() < 10 { return; } // Накопление данных
+    if min_price == 0.0 || min_price == f64::MAX { return; }
 
-    // Кулдаун 15 минут
-    if let Some(last) = state.cooldowns.get(symbol) {
-        if Instant::now().duration_since(*last) < Duration::from_secs(15 * 60) { return; }
-    }
+    let growth_pct = (max_price - min_price) / min_price;
+    if growth_pct <= 0.04 || growth_pct >= 0.15 { return; }
 
-    // Расчет метрик
-    let start_price = history.front().unwrap().price;
-    let end_price = history.back().unwrap().price;
-    let price_change_pct = (end_price - start_price) / start_price;
+    if max_time <= min_time || (max_time - min_time) < 3 { return; }
 
-    let (mut buy_vol, mut sell_vol) = (0.0, 0.0);
-    for t in history.iter() { if t.side == 1 { buy_vol += t.volume; } else { sell_vol += t.volume; } }
-    
-    let total_vol = buy_vol + sell_vol;
-    let delta = buy_vol - sell_vol;
+    let current_price = history.back().unwrap().close;
+    if current_price >= max_price * 0.99 { return; }
 
-    // Обновляем средний объем (экспоненциальное сглаживание)
-    let avg = state.avg_vol.entry(symbol.to_string()).or_insert(total_vol);
-    *avg = *avg * 0.99 + total_vol * 0.01;
-    if *avg < 10.0 { return; } // Фильтр шума
+    let signal_key = (symbol.to_string(), "ALGO_REVERSION".to_string());
+    let on_cooldown = cooldowns.get(&signal_key).map(|t| now_instant.duration_since(*t) < Duration::from_secs(60 * 60)).unwrap_or(false);
 
-    let mut signal = "";
-    // Сигнал 1: Памп/Дамп (Объем x5, Цена > 2%)
-    if total_vol > 5.0 * *avg && price_change_pct.abs() > 0.02 {
-        signal = if price_change_pct > 0.0 { "MEXC_PUMP" } else { "MEXC_DUMP" };
-    }
-    // Сигнал 2: Истощение (Buy Vol x5, Delta > 0, Цена стоит)
-    else if buy_vol > 5.0 * (*avg / 2.0) && delta > 0.0 && price_change_pct.abs() < 0.002 {
-        signal = "EXHAUSTION_SHORT";
-    }
-    // Сигнал 3: Поглощение (Sell Vol x5, Delta < 0, Цена стоит)
-    else if sell_vol > 5.0 * (*avg / 2.0) && delta < 0.0 && price_change_pct.abs() < 0.002 {
-        signal = "ABSORPTION_LONG";
-    }
+    if !on_cooldown {
+        let take_profit = max_price - ((max_price - min_price) * 0.5);
+        let stop_loss = max_price * 1.002;
+        let rr_ratio = if stop_loss - current_price != 0.0 { (current_price - take_profit) / (stop_loss - current_price) } else { 0.0 };
 
-    if !signal.is_empty() {
-        state.cooldowns.insert(symbol.to_string(), Instant::now());
+        cooldowns.insert(signal_key, now_instant);
         let msg = json!({
-            "type": "momentum", // Используем тип momentum для совместимости с Python
+            "type": "momentum",
             "data": [{
                 "symbol": symbol,
-                "signal": signal,
-                "price": end_price,
-                "change_pct": price_change_pct * 100.0,
-                "msg": format!("MEXC HFT: {} (Vol x{:.1})", signal, total_vol / *avg)
+                "signal": "ALGO_REVERSION",
+                "price": current_price,
+                "high": max_price,
+                "low": min_price,
+                "tp": take_profit,
+                "sl": stop_loss,
+                "rr": rr_ratio,
+                "msg": format!("Algo Reversion: Growth {:.2}% in {}m. Pullback started.", growth_pct * 100.0, max_time - min_time)
             }]
         });
         let _ = tx.send(Message::Text(msg.to_string()));
-        println!("🔥 MEXC Signal: {} on {}", signal, symbol);
+        println!("📉 ALGO_REVERSION: {}", symbol);
     }
 }
