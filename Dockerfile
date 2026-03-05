@@ -29,6 +29,9 @@ RUN apt-get update && apt-get install -y openssl ca-certificates && rm -rf /var/
 COPY backend_python/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 🟢 ДОБАВЬ ВОТ ЭТУ СТРОКУ (Копируем папку с интерфейсом в корень сервера):
+COPY frontend/ /frontend/
+
 # Копируем весь код Питона
 COPY backend_python/ .
 
