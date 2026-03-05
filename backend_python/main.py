@@ -13,7 +13,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 # --- TELEGRAM BOT SETUP ---
-API_TOKEN = "8475491805:AAHFUOPwmFlfPo3BGYCAv9tm2kB3XHI5pVA"  # Вставьте сюда токен от @BotFather
+API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # Инициализация бота и диспетчера
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
