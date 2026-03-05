@@ -4,3 +4,4 @@ websockets
 wsproto
 aiogram
 aiosqlite
+aiohttp

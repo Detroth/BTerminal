@@ -1,6 +1,7 @@
 import asyncio
 import os
 from typing import List, Set
+import aiohttp
 from contextlib import asynccontextmanager
 import aiosqlite
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
@@ -97,16 +98,30 @@ async def cmd_quant(message: types.Message):
     except Exception as e:
         await message.answer(f"⚠️ Ошибка получения статистики: {e}")
 
+async def keep_alive_ping():
+    EXTERNAL_URL = "https://quant-test.onrender.com"
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(EXTERNAL_URL) as response:
+                    pass
+        except Exception as e:
+            print(f"⚠️ [PING] Error: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: запускаем поллинг бота в фоне
     await init_db()
     polling_task = asyncio.create_task(dp.start_polling(bot))
+    ping_task = asyncio.create_task(keep_alive_ping())
     yield
     # Shutdown: останавливаем поллинг
     polling_task.cancel()
+    ping_task.cancel()
     try:
         await polling_task
+        await ping_task
     except asyncio.CancelledError:
         pass
 
