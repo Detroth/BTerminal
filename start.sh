@@ -1,11 +1,17 @@
 #!/bin/bash
 
-# 1. Запускаем Python-сервер в фоне (& в конце означает фоновый режим)
-# Uvicorn возьмет порт из переменной $PORT (Render её задает сам), либо 8000 по умолчанию.
-uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} &
+echo "🚀 Запускаем Python FastAPI..."
+uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000} &
+PYTHON_PID=$!
 
-# 2. Ждем 3 секунды, чтобы FastAPI успел открыть WebSocket
-sleep 3
+echo "⏳ Ждем 5 секунд для инициализации БД и веб-сокетов..."
+sleep 5
 
-# 3. Запускаем скомпилированный Rust-движок (он будет работать на переднем плане)
+# Проверяем, жив ли процесс Питона
+if ! kill -0 $PYTHON_PID 2>/dev/null; then
+  echo "❌ ОШИБКА: Python-сервер упал сразу после запуска! Ищи Traceback выше в логах."
+  exit 1
+fi
+
+echo "🦀 Запускаем Rust-движок..."
 ./rust_engine

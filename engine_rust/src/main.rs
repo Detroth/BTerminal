@@ -74,7 +74,9 @@ async fn main() {
 
     // Задача 1: WebSocket Writer с логикой реконнекта
     tokio::spawn(async move {
-        let internal_url = Url::parse("ws://localhost:8000/ws/internal").expect("Bad Internal URL");
+        let port = std::env::var("PORT").unwrap_or_else(|_| "8000".to_string());
+        let internal_ws_url = format!("ws://127.0.0.1:{}/ws/internal", port);
+        let internal_url = Url::parse(&internal_ws_url).expect("Bad Internal URL");
         loop {
             match connect_async(internal_url.clone()).await {
                 Ok((ws_stream, _)) => {
