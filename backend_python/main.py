@@ -23,7 +23,7 @@ dp = Dispatcher()
 subscribed_users: Set[int] = set()
 
 # --- DATABASE SETUP ---
-DB_NAME = "trading_journal.db"
+DB_NAME = os.environ.get("DB_PATH", "quant_journal.db")
 
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
