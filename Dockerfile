@@ -1,7 +1,7 @@
 # ==========================================
 # ЭТАП 1: Сборка Rust-ядра
 # ==========================================
-FROM rust:1.76-slim as rust-builder
+FROM rust:slim as rust-builder
 
 WORKDIR /build
 # Копируем только папку с Rust
