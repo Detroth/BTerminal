@@ -570,9 +570,6 @@ async fn process_mexc_candle(symbol: &str, data: MexcData, state: &mut MexcScann
         history.push_back(finalized_candle);
         if history.len() > 30 { history.pop_front(); }
 
-        let vol_24h = state.daily_volumes.get(symbol).cloned().unwrap_or(0.0);
-        analyze_history(symbol, history, &mut state.cooldowns, vol_24h, tx).await;
-
         *candle = TickData {
             timestamp: current_minute,
             open: data.p,
@@ -587,10 +584,19 @@ async fn process_mexc_candle(symbol: &str, data: MexcData, state: &mut MexcScann
     if data.p < candle.low { candle.low = data.p; }
     candle.close = data.p;
     candle.volume += data.v;
+
+    // FIX: Анализируем рынок в реальном времени (каждый тик), а не только при закрытии свечи
+    let history = state.history.entry(symbol.to_string()).or_default();
+    let mut full_history = history.clone();
+    full_history.push_back(candle.clone());
+    
+    let vol_24h = state.daily_volumes.get(symbol).cloned().unwrap_or(0.0);
+    analyze_history(symbol, &full_history, &mut state.cooldowns, vol_24h, tx).await;
 }
 
 async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: &mut HashMap<(String, String), Instant>, vol_24h: f64, tx: &mpsc::UnboundedSender<Message>) {
-    if history.len() < 2 { return; }
+    // FIX: Разрешаем анализ даже с 1 свечой (текущей), чтобы ловить пампы сразу после подписки
+    if history.len() < 1 { return; }
 
     let now_instant = Instant::now();
     let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
