@@ -414,8 +414,8 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                     tickers.sort_by(|a, b| b.amount_24.partial_cmp(&a.amount_24).unwrap_or(std::cmp::Ordering::Equal));
                                     
                                     // FIX: Ограничиваем до 150 пар, чтобы не упереться в лимиты WebSocket
-                                    if tickers.len() > 150 {
-                                        tickers.truncate(150);
+                                    if tickers.len() > 250 {
+                                        tickers.truncate(250);
                                     }
                                     
                                     let min_vol = tickers.last().map(|t| t.amount_24).unwrap_or(0.0);
@@ -440,7 +440,7 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                 }
                             }
                         }
-                        sleep(Duration::from_secs(10)).await;
+                        sleep(Duration::from_secs(15)).await;
                     }
                 });
 
