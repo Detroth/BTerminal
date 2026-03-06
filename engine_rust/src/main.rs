@@ -408,7 +408,7 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                         vol_map.insert(t.symbol.clone(), t.amount_24);
                                     }
                                     
-                                    for t in tickers.iter().take(40) {
+                                    for t in tickers.iter() {
                                         targets.push(t.symbol.clone());
                                     }
 
@@ -551,7 +551,7 @@ async fn process_mexc_candle(symbol: &str, data: MexcData, state: &mut MexcScann
 }
 
 async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: &mut HashMap<(String, String), Instant>, vol_24h: f64, tx: &mpsc::UnboundedSender<Message>) {
-    if history.len() < 15 { return; }
+    if history.len() < 2 { return; }
 
     let now_instant = Instant::now();
     let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
