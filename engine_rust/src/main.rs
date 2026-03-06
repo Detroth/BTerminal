@@ -351,10 +351,11 @@ struct MexcScannerState {
     current_candles: HashMap<String, TickData>,
     cooldowns: HashMap<(String, String), Instant>,
     daily_changes: HashMap<String, f64>,
+    daily_volumes: HashMap<String, f64>,
 }
 
 enum ScannerControl {
-    MarketUpdate { targets: Vec<String>, daily_changes: HashMap<String, f64> },
+    MarketUpdate { targets: Vec<String>, daily_changes: HashMap<String, f64>, daily_volumes: HashMap<String, f64> },
 }
 
 async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
@@ -393,6 +394,7 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                 if json.success {
                                     let mut targets = Vec::new();
                                     let mut daily_map = HashMap::new();
+                                    let mut vol_map = HashMap::new();
                                     
                                     // Filter liquid pairs
                                     let mut tickers = json.data;
@@ -403,6 +405,7 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                     // Since we moved json.data to tickers, we iterate tickers.
                                     for t in &tickers {
                                         daily_map.insert(t.symbol.clone(), t.rise_fall_rate);
+                                        vol_map.insert(t.symbol.clone(), t.amount_24);
                                     }
                                     
                                     for t in tickers.iter().take(40) {
@@ -411,7 +414,8 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
 
                                     let _ = ctrl_tx.send(ScannerControl::MarketUpdate { 
                                         targets, 
-                                        daily_changes: daily_map 
+                                        daily_changes: daily_map,
+                                        daily_volumes: vol_map
                                     });
                                 }
                             }
@@ -426,6 +430,7 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                     current_candles: HashMap::new(),
                     cooldowns: HashMap::new(),
                     daily_changes: HashMap::new(),
+                    daily_volumes: HashMap::new(),
                 };
                 
                 let mut subscribed_set: HashSet<String> = HashSet::new();
@@ -462,8 +467,9 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                         }
                         Some(ctrl) = ctrl_rx.recv() => {
                             match ctrl {
-                                ScannerControl::MarketUpdate { targets, daily_changes } => {
+                                ScannerControl::MarketUpdate { targets, daily_changes, daily_volumes } => {
                                     state.daily_changes = daily_changes;
+                                    state.daily_volumes = daily_volumes;
                                     let new_set: HashSet<String> = targets.into_iter().collect();
                                     
                                     // Subscribe new
@@ -525,7 +531,8 @@ async fn process_mexc_candle(symbol: &str, data: MexcData, state: &mut MexcScann
         history.push_back(finalized_candle);
         if history.len() > 30 { history.pop_front(); }
 
-        analyze_history(symbol, history, &mut state.cooldowns, tx).await;
+        let vol_24h = state.daily_volumes.get(symbol).cloned().unwrap_or(0.0);
+        analyze_history(symbol, history, &mut state.cooldowns, vol_24h, tx).await;
 
         *candle = TickData {
             timestamp: current_minute,
@@ -543,12 +550,48 @@ async fn process_mexc_candle(symbol: &str, data: MexcData, state: &mut MexcScann
     candle.volume += data.v;
 }
 
-async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: &mut HashMap<(String, String), Instant>, tx: &mpsc::UnboundedSender<Message>) {
+async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: &mut HashMap<(String, String), Instant>, vol_24h: f64, tx: &mpsc::UnboundedSender<Message>) {
     if history.len() < 15 { return; }
 
     let now_instant = Instant::now();
+    let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     
-    // ALGO REVERSION Logic
+    // --- STRATEGY 1: SPLASH (Global Inefficiency) ---
+    // Window: 30 mins (Full history)
+    let mut min_p_30 = f64::MAX;
+    let mut max_p_30 = f64::MIN;
+    for candle in history.iter() {
+        if candle.low < min_p_30 { min_p_30 = candle.low; }
+        if candle.high > max_p_30 { max_p_30 = candle.high; }
+    }
+
+    if min_p_30 > 0.0 {
+        let growth_30 = (max_p_30 - min_p_30) / min_p_30;
+        if growth_30 >= 0.09 {
+            let key = (symbol.to_string(), "SPLASH".to_string());
+            let on_cooldown = cooldowns.get(&key).map(|t| now_instant.duration_since(*t) < Duration::from_secs(60 * 60)).unwrap_or(false);
+            
+            if !on_cooldown {
+                cooldowns.insert(key, now_instant);
+                let msg = json!({
+                    "type": "momentum",
+                    "data": [{
+                        "symbol": symbol,
+                        "signal_type": "SPLASH",
+                        "current_price": history.back().unwrap().close,
+                        "fair_price": (max_p_30 + min_p_30) / 2.0,
+                        "change_pct": growth_30 * 100.0,
+                        "volume_24h": vol_24h,
+                        "timestamp": now_unix
+                    }]
+                });
+                let _ = tx.send(Message::Text(msg.to_string()));
+            }
+        }
+    }
+
+    // --- STRATEGY 2: ADVANCED (Algo Reversion) ---
+    // Window: 15 mins
     let start_idx = history.len().saturating_sub(15);
     let window_iter = history.iter().skip(start_idx);
 
@@ -578,7 +621,7 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
     let current_price = history.back().unwrap().close;
     if current_price >= max_price * 0.99 { return; }
 
-    let signal_key = (symbol.to_string(), "ALGO_REVERSION".to_string());
+    let signal_key = (symbol.to_string(), "ADVANCED".to_string());
     let on_cooldown = cooldowns.get(&signal_key).map(|t| now_instant.duration_since(*t) < Duration::from_secs(60 * 60)).unwrap_or(false);
 
     if !on_cooldown {
@@ -591,17 +634,15 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
             "type": "momentum",
             "data": [{
                 "symbol": symbol,
-                "signal": "ALGO_REVERSION",
-                "price": current_price,
-                "high": max_price,
-                "low": min_price,
-                "tp": take_profit,
-                "sl": stop_loss,
-                "rr": rr_ratio,
-                "msg": format!("Algo Reversion: Growth {:.2}% in {}m. Pullback started.", growth_pct * 100.0, max_time - min_time)
+                "signal_type": "ADVANCED",
+                "current_price": current_price,
+                "fair_price": take_profit,
+                "change_pct": growth_pct * 100.0,
+                "volume_24h": vol_24h,
+                "timestamp": now_unix
             }]
         });
         let _ = tx.send(Message::Text(msg.to_string()));
-        println!("📉 ALGO_REVERSION: {}", symbol);
+        println!("📉 ADVANCED: {}", symbol);
     }
 }

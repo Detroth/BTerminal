@@ -1,5 +1,6 @@
 import asyncio
 import os
+import datetime
 from typing import List, Set
 import aiohttp
 from contextlib import asynccontextmanager
@@ -8,92 +9,177 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # --- TELEGRAM BOT SETUP ---
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) # ID админа для доступа к статистике
 
 # Инициализация бота и диспетчера
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-
-# Хранилище подписчиков (в памяти)
-subscribed_users: Set[int] = set()
 
 # --- DATABASE SETUP ---
 DB_NAME = os.environ.get("DB_PATH", "quant_journal.db")
 
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
+        # Таблица пользователей и их настроек
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS signals_history (
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id INTEGER PRIMARY KEY,
+                splash_threshold INTEGER DEFAULT 9,
+                advanced_enabled BOOLEAN DEFAULT 1,
+                min_volume REAL DEFAULT 400000
+            )
+        """)
+        # Таблица сигналов SPLASH
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS signals_splash (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 symbol TEXT,
-                signal_type TEXT,
+                price REAL,
+                change_pct REAL,
+                volume_24h REAL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Таблица сигналов ADVANCED
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS signals_advanced (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
                 entry_price REAL,
-                take_profit REAL,
-                stop_loss REAL,
-                status TEXT DEFAULT 'OPEN'
+                fair_price REAL,
+                volume_24h REAL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
         await db.commit()
 
-async def save_signal_to_db(symbol: str, signal_type: str, entry: float, tp: float, sl: float):
-    try:
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute(
-                "INSERT INTO signals_history (symbol, signal_type, entry_price, take_profit, stop_loss) VALUES (?, ?, ?, ?, ?)",
-                (symbol, signal_type, entry, tp, sl)
-            )
-            await db.commit()
-            print(f"💾 [DB] Saved signal: {symbol} {signal_type}")
-    except Exception as e:
-        print(f"⚠️ [DB] Error saving signal: {e}")
-
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    subscribed_users.add(message.chat.id)
-    print(f"✅ [BOT] Новый подписчик: {message.chat.id}")
-    await message.answer("🚀 <b>Терминал запущен.</b>\nОжидаю сигналы с рынка...")
+    user_id = message.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (user_id,))
+        await db.commit()
+    await message.answer("🚀 <b>SaaS Терминал запущен.</b>\nИспользуйте /settings для настройки персональных фильтров.")
 
-@dp.message(Command("status"))
-async def cmd_status(message: types.Message):
-    try:
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT COUNT(*) FROM signals_history WHERE date(timestamp) = date('now')") as cursor:
-                today_signals_count = (await cursor.fetchone())[0]
+# --- USER SETTINGS & UI ---
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: types.Message):
+    user_id = message.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Регистрируем если нет, или получаем настройки
+        await db.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (user_id,))
+        await db.commit()
+        async with db.execute("SELECT splash_threshold, advanced_enabled, min_volume FROM users WHERE telegram_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+    
+    await send_settings_keyboard(message, row)
+
+async def send_settings_keyboard(message_or_callback, settings):
+    splash_th, adv_en, min_vol = settings
+    
+    # Текст кнопок
+    splash_text = f"🌊 Сплеши: >{splash_th}%" if splash_th < 100 else "🌊 Сплеши: ВЫКЛ"
+    adv_text = f"🧠 Advanced: {'ВКЛ' if adv_en else 'ВЫКЛ'}"
+    vol_text = f"📊 Объем: >${int(min_vol/1000)}k" if min_vol > 0 else "📊 Объем: Любой"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=splash_text, callback_data="toggle_splash")],
+        [InlineKeyboardButton(text=adv_text, callback_data="toggle_advanced")],
+        [InlineKeyboardButton(text=vol_text, callback_data="toggle_volume")]
+    ])
+    
+    text = "⚙️ <b>Персональные фильтры:</b>\nНастройте уведомления под свой риск-профиль."
+    
+    if isinstance(message_or_callback, types.Message):
+        await message_or_callback.answer(text, reply_markup=keyboard)
+    elif isinstance(message_or_callback, CallbackQuery):
+        await message_or_callback.message.edit_text(text, reply_markup=keyboard)
+
+@dp.callback_query(F.data == "toggle_splash")
+async def cb_toggle_splash(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT splash_threshold FROM users WHERE telegram_id = ?", (user_id,)) as cursor:
+            current = (await cursor.fetchone())[0]
         
-        await message.answer(
-            f"<b>🟢 Статус Движка</b>\n"
-            f"Соединение с MEXC: Активно\n"
-            f"Сигналов за сегодня: {today_signals_count}\n"
-            f"Радар работает в штатном режиме."
-        )
-    except Exception as e:
-        await message.answer(f"⚠️ Ошибка получения статуса: {e}")
+        # Логика переключения: 9 -> 12 -> 50 -> 999 (Выкл) -> 9
+        if current == 9: new_val = 12
+        elif current == 12: new_val = 50
+        elif current == 50: new_val = 999
+        else: new_val = 9
+        
+        await db.execute("UPDATE users SET splash_threshold = ? WHERE telegram_id = ?", (new_val, user_id))
+        await db.commit()
+        
+        # Обновляем UI
+        async with db.execute("SELECT splash_threshold, advanced_enabled, min_volume FROM users WHERE telegram_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+    
+    await send_settings_keyboard(callback, row)
+    await callback.answer("Порог обновлен")
+
+@dp.callback_query(F.data == "toggle_advanced")
+async def cb_toggle_advanced(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT advanced_enabled FROM users WHERE telegram_id = ?", (user_id,)) as cursor:
+            current = (await cursor.fetchone())[0]
+        
+        new_val = 0 if current else 1
+        await db.execute("UPDATE users SET advanced_enabled = ? WHERE telegram_id = ?", (new_val, user_id))
+        await db.commit()
+        
+        async with db.execute("SELECT splash_threshold, advanced_enabled, min_volume FROM users WHERE telegram_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            
+    await send_settings_keyboard(callback, row)
+    await callback.answer("Стратегия переключена")
+
+@dp.callback_query(F.data == "toggle_volume")
+async def cb_toggle_volume(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT min_volume FROM users WHERE telegram_id = ?", (user_id,)) as cursor:
+            current = (await cursor.fetchone())[0]
+        
+        new_val = 0 if current == 400000 else 400000
+        await db.execute("UPDATE users SET min_volume = ? WHERE telegram_id = ?", (new_val, user_id))
+        await db.commit()
+        
+        async with db.execute("SELECT splash_threshold, advanced_enabled, min_volume FROM users WHERE telegram_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            
+    await send_settings_keyboard(callback, row)
+    await callback.answer("Фильтр объема обновлен")
 
 @dp.message(Command("quant"))
 async def cmd_quant(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return # Игнорируем не-админов
+        
     try:
         async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT COUNT(*) FROM signals_history WHERE status = 'OPEN'") as cursor:
-                open_trades = (await cursor.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM signals_history WHERE status = 'WIN'") as cursor:
-                win_trades = (await cursor.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM signals_history WHERE status = 'LOSS'") as cursor:
-                loss_trades = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM users") as cursor:
+                users_count = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM signals_splash WHERE date(timestamp) = date('now')") as cursor:
+                splash_today = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM signals_advanced WHERE date(timestamp) = date('now')") as cursor:
+                advanced_today = (await cursor.fetchone())[0]
         
         await message.answer(
-            f"<b>🗄 Quant-Журнал (Paper Trading)</b>\n"
-            f"Открытых сделок (Ожидают TP/SL): {open_trades}\n"
-            f"Закрытых в плюс (WIN): {win_trades}\n"
-            f"Закрытых в минус (LOSS): {loss_trades}\n"
-            f"──────────────\n"
-            f"Сбор датасета для модели ожиданий продолжается."
+            f"<b>📊 Сводка SaaS-продукта</b>\n"
+            f"Активных юзеров: {users_count}\n"
+            f"Поймано Сплешей (сегодня): {splash_today}\n"
+            f"Поймано Алгоритмов (сегодня): {advanced_today}"
         )
     except Exception as e:
         await message.answer(f"⚠️ Ошибка получения статистики: {e}")
@@ -178,43 +264,57 @@ async def internal_endpoint(websocket: WebSocket):
             data = await websocket.receive_json()
             await manager.broadcast(data)
             
-            # Обработка сигналов для Telegram
+            # Роутер сигналов
             if data.get("type") == "momentum":
                 items = data.get("data", [])
                 if not isinstance(items, list):
                     items = [items]
                 
-                # Лог для отладки: видим, что сигнал пришел
                 print(f"📩 [INTERNAL] Получен сигнал Momentum: {len(items)} шт.")
 
-                for item in items:
-                    signal = item.get("signal")
-                    symbol = item.get("symbol")
-                    change = item.get("change_pct", 0)
-                    
-                    text = ""
-                    if signal == "MACRO_PUMP":
-                        text = f"<b>🟢 ЗАРОЖДЕНИЕ ТРЕНДА (15m)</b>\nПара: #{symbol}\nДетали: Аномальный рост объемов (x10) и цены. Крупный игрок набирает позицию."
-                        # Save to DB (no TP/SL)
-                        price = item.get("price", 0)
-                        asyncio.create_task(save_signal_to_db(symbol, signal, price, 0, 0))
-                    elif signal == "EXHAUSTION":
-                        text = f"<b>🔴 ИСТОЩЕНИЕ ПОКУПАТЕЛЯ (3m)</b>\nПара: #{symbol}\nДетали: Огромный объем сдерживается лимитными ордерами. Цена остановилась. Приготовиться к контр-сделке (Short) или закрытию лонга!"
-                        # Save to DB (no TP/SL)
-                        price = item.get("price", 0)
-                        asyncio.create_task(save_signal_to_db(symbol, signal, price, 0, 0))
-                    elif signal == "ALGO_REVERSION":
-                        price = item.get("price", 0)
-                        high = item.get("high", 0)
-                        tp = item.get("tp", 0)
-                        sl = item.get("sl", 0)
-                        text = f"<b>🤖 АЛГОРИТМИЧЕСКИЙ ОТКАТ (ШОРТ)</b>\nПара: #{symbol}\nТекущая цена: {price:.5f}\n──────────────\n🔴 <b>Stop Loss:</b> {sl:.5f} (за хай {high:.5f})\n🟢 <b>Take Profit:</b> {tp:.5f} (50% коррекции)\n──────────────\nЛогика: Органический рост завершен, алгоритмы возвращают цену в зону баланса. Заходим со стопом!"
+                async with aiosqlite.connect(DB_NAME) as db:
+                    for item in items:
+                        signal_type = item.get("signal_type")
+                        symbol = item.get("symbol")
+                        price = item.get("current_price")
+                        fair_price = item.get("fair_price")
+                        change_pct = item.get("change_pct")
+                        volume_24h = item.get("volume_24h")
+                        ts_raw = item.get("timestamp", 0)
                         
-                        # Save to DB
-                        asyncio.create_task(save_signal_to_db(symbol, signal, price, tp, sl))
-                    
-                    if text:
-                        asyncio.create_task(send_telegram_alert(text))
+                        # Конвертация времени
+                        timestamp_converted = datetime.datetime.fromtimestamp(ts_raw).strftime('%Y-%m-%d %H:%M:%S')
+
+                        # 1. Сохранение в БД
+                        if signal_type == "SPLASH":
+                            await db.execute("INSERT INTO signals_splash (symbol, price, change_pct, volume_24h, timestamp) VALUES (?, ?, ?, ?, ?)", (symbol, price, change_pct, volume_24h, timestamp_converted))
+                        elif signal_type == "ADVANCED":
+                            await db.execute("INSERT INTO signals_advanced (symbol, entry_price, fair_price, volume_24h, timestamp) VALUES (?, ?, ?, ?, ?)", (symbol, price, fair_price, volume_24h, timestamp_converted))
+                        await db.commit()
+
+                        # 2. Рассылка пользователям (Роутинг)
+                        async with db.execute("SELECT telegram_id, splash_threshold, advanced_enabled, min_volume FROM users") as cursor:
+                            users = await cursor.fetchall()
+                        
+                        for user in users:
+                            uid, splash_th, adv_en, min_vol = user
+                            
+                            # Фильтр объема
+                            if volume_24h < min_vol: continue
+                            
+                            send = False
+                            if signal_type == "SPLASH":
+                                if change_pct >= splash_th: send = True
+                            elif signal_type == "ADVANCED":
+                                if adv_en: send = True
+                            
+                            if send:
+                                msg_text = f"<b>⚡️ {signal_type}</b>\nПара: #{symbol}\nИзменение: +{change_pct:.2f}%\nЦена: {price}\nСправедливая цена: {fair_price}\nОбъем 24h: ${volume_24h:,.0f}\nВремя: {timestamp_converted}"
+                                try:
+                                    await bot.send_message(uid, msg_text)
+                                except Exception as e:
+                                    print(f"Failed to send to {uid}: {e}")
+
     except Exception as e:
         print(f"Internal engine disconnected: {e}")
 
