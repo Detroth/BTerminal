@@ -413,7 +413,13 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                     tickers.retain(|t| t.amount_24 >= 50_000.0 && t.symbol != "BTC_USDT" && t.symbol != "ETH_USDT");
                                     tickers.sort_by(|a, b| b.amount_24.partial_cmp(&a.amount_24).unwrap_or(std::cmp::Ordering::Equal));
                                     
-                                    println!("🏹 Hunter: Scanned {} pairs. Tracking {} active pairs (Vol > $50k).", total_pairs, tickers.len());
+                                    // FIX: Ограничиваем до 150 пар, чтобы не упереться в лимиты WebSocket
+                                    if tickers.len() > 150 {
+                                        tickers.truncate(150);
+                                    }
+                                    
+                                    let min_vol = tickers.last().map(|t| t.amount_24).unwrap_or(0.0);
+                                    println!("🏹 Hunter: Tracking top {} pairs (Vol > ${:.0}). Total scanned: {}", tickers.len(), min_vol, total_pairs);
 
                                     // Populate daily_map from tickers (before filtering/taking top 40 if needed, or just from filtered)
                                     // Since we moved json.data to tickers, we iterate tickers.
@@ -469,10 +475,19 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                         let _ = ws_msg_tx_pong.send(Message::Text(json!({"method": "pong"}).to_string()));
                                         continue;
                                     }
-                                    if let Ok(event) = serde_json::from_str::<MexcResponse>(&text) {
-                                        if let (Some(symbol), Some(data)) = (event.symbol, event.data) {
-                                            process_mexc_candle(&symbol, data, &mut state, &tx).await;
+                                    
+                                    // FIX: Логируем все ответы биржи, чтобы видеть ошибки подписки
+                                    let v: serde_json::Value = match serde_json::from_str(&text) {
+                                        Ok(val) => val,
+                                        Err(_) => { println!("⚠️ WS MALFORMED: {}", text); continue; }
+                                    };
+
+                                    if let (Some(symbol), Some(data_obj)) = (v["symbol"].as_str(), v["data"].as_object()) {
+                                        if let Ok(data) = serde_json::from_value::<MexcData>(v["data"].clone()) {
+                                            process_mexc_candle(symbol, data, &mut state, &tx).await;
                                         }
+                                    } else {
+                                        println!("ℹ️ WS MSG: {}", text);
                                     }
                                 }
                                 Ok(_) => {},
@@ -499,8 +514,8 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                             for pair in to_subscribe {
                                                 let msg = json!({ "method": "sub.deal", "param": { "symbol": pair } });
                                                 if tx.send(Message::Text(msg.to_string())).is_err() { break; }
-                                                // FIX: Ускоряем очередь (4мс = 250/сек), чтобы успеть до следующего цикла Hunter (10с)
-                                                sleep(Duration::from_millis(4)).await;
+                                                // FIX: Замедляем очередь (50мс), чтобы биржа успевала обрабатывать подписки
+                                                sleep(Duration::from_millis(50)).await;
                                             }
                                         });
                                     }
