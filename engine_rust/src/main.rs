@@ -361,7 +361,11 @@ enum ScannerControl {
 async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
     let connect_addr = "wss://contract.mexc.com/edge";
     let url = Url::parse(connect_addr).expect("Bad MEXC URL");
-    let http_client = reqwest::Client::new();
+    // FIX: Добавляем User-Agent, чтобы избежать 403 Forbidden от Cloudflare
+    let http_client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+        .build()
+        .unwrap();
     
     println!("Connecting to MEXC Futures Scanner: {}", connect_addr);
 
@@ -398,6 +402,13 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                     
                                     // Filter liquid pairs
                                     let mut tickers = json.data;
+                                    
+                                    // FIX: Защита от сбоя API. Если список пуст, не сбрасываем подписки.
+                                    if tickers.is_empty() {
+                                        println!("⚠️ Hunter: Received empty ticker list. Skipping update.");
+                                        continue;
+                                    }
+
                                     let total_pairs = tickers.len();
                                     tickers.retain(|t| t.amount_24 >= 50_000.0 && t.symbol != "BTC_USDT" && t.symbol != "ETH_USDT");
                                     tickers.sort_by(|a, b| b.amount_24.partial_cmp(&a.amount_24).unwrap_or(std::cmp::Ordering::Equal));
@@ -476,12 +487,22 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                     let new_set: HashSet<String> = targets.into_iter().collect();
                                     
                                     // Subscribe new
-                                    for pair in &new_set {
-                                        if !subscribed_set.contains(pair) {
-                                            let msg = json!({ "method": "sub.deal", "param": { "symbol": pair } });
-                                            let _ = ws_msg_tx_pong.send(Message::Text(msg.to_string()));
-                                            println!("MEXC Subscribing: {}", pair);
-                                        }
+                                    let to_subscribe: Vec<String> = new_set.iter()
+                                        .filter(|p| !subscribed_set.contains(*p))
+                                        .cloned()
+                                        .collect();
+
+                                    if !to_subscribe.is_empty() {
+                                        println!("📝 Queueing subscription for {} new pairs...", to_subscribe.len());
+                                        let tx = ws_msg_tx_pong.clone();
+                                        tokio::spawn(async move {
+                                            for pair in to_subscribe {
+                                                let msg = json!({ "method": "sub.deal", "param": { "symbol": pair } });
+                                                if tx.send(Message::Text(msg.to_string())).is_err() { break; }
+                                                // FIX: Ускоряем очередь (4мс = 250/сек), чтобы успеть до следующего цикла Hunter (10с)
+                                                sleep(Duration::from_millis(4)).await;
+                                            }
+                                        });
                                     }
                                     
                                     // Unsubscribe old
