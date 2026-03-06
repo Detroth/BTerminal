@@ -398,9 +398,12 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                     
                                     // Filter liquid pairs
                                     let mut tickers = json.data;
+                                    let total_pairs = tickers.len();
                                     tickers.retain(|t| t.amount_24 >= 50_000.0 && t.symbol != "BTC_USDT" && t.symbol != "ETH_USDT");
                                     tickers.sort_by(|a, b| b.amount_24.partial_cmp(&a.amount_24).unwrap_or(std::cmp::Ordering::Equal));
                                     
+                                    println!("🏹 Hunter: Scanned {} pairs. Tracking {} active pairs (Vol > $50k).", total_pairs, tickers.len());
+
                                     // Populate daily_map from tickers (before filtering/taking top 40 if needed, or just from filtered)
                                     // Since we moved json.data to tickers, we iterate tickers.
                                     for t in &tickers {
@@ -567,11 +570,19 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
 
     if min_p_30 > 0.0 {
         let growth_30 = (max_p_30 - min_p_30) / min_p_30;
+        
+        // DEBUG: Логируем заметные движения (>5%), чтобы проверить видимость
+        if growth_30 > 0.05 {
+             println!("👀 WATCH: {} Growth: {:.2}% (Min: {}, Max: {}) Vol: {:.0} Hist: {}", 
+                symbol, growth_30 * 100.0, min_p_30, max_p_30, vol_24h, history.len());
+        }
+
         if growth_30 >= 0.09 {
             let key = (symbol.to_string(), "SPLASH".to_string());
             let on_cooldown = cooldowns.get(&key).map(|t| now_instant.duration_since(*t) < Duration::from_secs(60 * 60)).unwrap_or(false);
             
             if !on_cooldown {
+                println!("🚀 SPLASH TRIGGER: {} Growth: {:.2}% Vol: {:.0}", symbol, growth_30 * 100.0, vol_24h);
                 cooldowns.insert(key, now_instant);
                 let msg = json!({
                     "type": "momentum",
@@ -586,6 +597,8 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
                     }]
                 });
                 let _ = tx.send(Message::Text(msg.to_string()));
+            } else {
+                println!("❄️ COOLDOWN: {} (SPLASH already sent < 60m ago)", symbol);
             }
         }
     }

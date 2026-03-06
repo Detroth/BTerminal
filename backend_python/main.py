@@ -259,7 +259,7 @@ async def internal_endpoint(websocket: WebSocket):
                 if not isinstance(items, list):
                     items = [items]
                 
-                print(f"📩 [INTERNAL] Получен сигнал Momentum: {len(items)} шт.")
+                # print(f"📩 [INTERNAL] Получен сигнал Momentum: {len(items)} шт.")
 
                 async with aiosqlite.connect(DB_NAME) as db:
                     for item in items:
@@ -271,6 +271,8 @@ async def internal_endpoint(websocket: WebSocket):
                         volume_24h = item.get("volume_24h")
                         ts_raw = item.get("timestamp", 0)
                         
+                        print(f"🔍 ROUTING: {symbol} {signal_type} +{change_pct:.2f}% Vol: {volume_24h:,.0f}")
+
                         # Конвертация времени
                         timestamp_converted = datetime.datetime.fromtimestamp(ts_raw).strftime('%Y-%m-%d %H:%M:%S')
 
@@ -289,17 +291,26 @@ async def internal_endpoint(websocket: WebSocket):
                             uid, splash_th, adv_en, min_vol = user
                             
                             # Фильтр объема
-                            if volume_24h < min_vol: continue
+                            if volume_24h < min_vol:
+                                print(f"  ❌ User {uid}: Skip Low Vol ({volume_24h:,.0f} < {min_vol:,.0f})")
+                                continue
                             
                             send = False
                             if signal_type == "SPLASH":
-                                if change_pct >= splash_th: send = True
+                                if change_pct >= splash_th: 
+                                    send = True
+                                else:
+                                    print(f"  ❌ User {uid}: Skip Low Pct ({change_pct:.2f}% < {splash_th}%)")
                             elif signal_type == "ADVANCED":
-                                if adv_en: send = True
+                                if adv_en: 
+                                    send = True
+                                else:
+                                    print(f"  ❌ User {uid}: Skip Advanced Disabled")
                             
                             if send:
                                 msg_text = f"<b>⚡️ {signal_type}</b>\nПара: #{symbol}\nИзменение: +{change_pct:.2f}%\nЦена: {price}\nСправедливая цена: {fair_price}\nОбъем 24h: ${volume_24h:,.0f}\nВремя: {timestamp_converted}"
                                 try:
+                                    print(f"  ✅ User {uid}: SENDING ALERT...")
                                     await bot.send_message(uid, msg_text)
                                 except Exception as e:
                                     print(f"Failed to send to {uid}: {e}")
