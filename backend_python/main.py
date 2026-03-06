@@ -17,7 +17,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 
 # --- TELEGRAM BOT SETUP ---
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) # ID админа для доступа к статистике
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1115714808")) # ID админа для доступа к статистике
 
 # Инициализация бота и диспетчера
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -243,17 +243,6 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.receive_text() # Держим соединение открытым
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-
-async def send_telegram_alert(text: str):
-    if not subscribed_users:
-        print("⚠️ [BOT] Нет подписчиков для отправки уведомления! (Отправьте /start)")
-        return
-
-    for chat_id in subscribed_users:
-        try:
-            await bot.send_message(chat_id=chat_id, text=text)
-        except Exception as e:
-            print(f"Failed to send TG message: {e}")
 
 # Внутренний WebSocket для Rust-движка
 @app.websocket("/ws/internal")
