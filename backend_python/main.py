@@ -3,7 +3,13 @@ import os
 import datetime
 from typing import List, Set
 import aiohttp
+import pandas as pd
+import io
 from contextlib import asynccontextmanager
+import matplotlib
+matplotlib.use('Agg') # Устанавливаем неинтерактивный бэкенд для сервера
+import matplotlib.pyplot as plt
+import seaborn as sns
 import aiosqlite
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from fastapi.responses import FileResponse
@@ -17,7 +23,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 
 # --- TELEGRAM BOT SETUP ---
 #API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-API_TOKEN = "8634666749:AAEZWaxSUGUlXIu0-60S_0X1sGpsA4uK7MA"
+API_TOKEN = "8634666749:AAGtDEll_hLpQm2VKfFZHbCNPUSW8KRPcNg"
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1115714808")) # ID админа для доступа к статистике
 
 # Инициализация бота и диспетчера
@@ -275,6 +281,240 @@ async def cmd_list_users(message: types.Message):
         response_text += f"- `{user[0]}`\n"
     
     await message.answer(response_text)
+
+# --- QUANT CHECKER & REPORTING ---
+
+async def check_signal_outcome(symbol: str, signal_ts_str: str, entry_price: float, change_pct: float) -> dict:
+    """
+    Валидирует сигнал по историческим данным MEXC (Spot API).
+    Стратегия: Short (Mean Reversion) на пампе.
+    """
+    # 1. Подготовка параметров
+    # MEXC Spot V3 требует формат BTCUSDT, а у нас BTC_USDT
+    clean_symbol = symbol.replace("_", "")
+    
+    try:
+        dt_obj = datetime.datetime.strptime(signal_ts_str, '%Y-%m-%d %H:%M:%S')
+        # Принудительно ставим UTC, чтобы timestamp() не использовал локальное время сервера
+        dt_obj = dt_obj.replace(tzinfo=datetime.timezone.utc)
+        start_time = int(dt_obj.timestamp() * 1000)
+    except ValueError:
+        return {"status": "ERROR", "reason": "Date parse fail"}
+
+    # 2. Расчет уровней (предполагаем Short на пампе)
+    # Если цена выросла на change_pct, значит Low движения был:
+    implied_low = entry_price / (1 + change_pct / 100.0)
+    
+    # Take Profit: 50% отката движения (Fair Price)
+    tp_price = (entry_price + implied_low) / 2.0
+    
+    # Stop Loss: Хай сплеша (в данном случае Entry Price, так как мы ловим вершину)
+    # Даем небольшой буфер 0.5% вверх, чтобы не выбивало шумом
+    sl_price = entry_price * 1.005
+
+    # 3. Запрос к API
+    url = "https://api.mexc.com/api/v3/klines"
+    params = {
+        "symbol": clean_symbol,
+        "interval": "1m",
+        "startTime": start_time,
+        "limit": 120 # 2 часа на отработку
+    }
+
+    # Добавляем User-Agent, так как MEXC часто блокирует запросы без него (Cloudflare)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    }
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        try:
+            async with session.get(url, params=params, timeout=10) as resp:
+                if resp.status != 200:
+                    return {"status": "API_ERROR", "code": resp.status}
+                klines = await resp.json()
+        except Exception as e:
+            return {"status": "NET_ERROR", "error": str(e)}
+
+    # Учитываем опыт: проверяем, что пришел именно список (данные), а не словарь (ошибка)
+    if not klines or not isinstance(klines, list):
+        if isinstance(klines, dict) and "msg" in klines:
+             return {"status": "API_MSG", "error": klines["msg"]}
+        return {"status": "NO_DATA"}
+
+    # 4. Анализ свечей
+    # kline format: [time, open, high, low, close, vol, ...]
+    for i, k in enumerate(klines):
+        high = float(k[2])
+        low = float(k[3])
+        # Защита от битых данных
+        if len(k) < 5: continue
+        
+        try:
+            # Цены приходят строками, конвертируем
+            high = float(k[2])
+            low = float(k[3])
+        except (ValueError, IndexError):
+            continue
+        
+        # Проверка SL (цена ушла выше хая)
+        if high > sl_price:
+            return {"status": "LOSS", "time_to_take_mins": i + 1, "exit_price": high}
+        
+        # Проверка TP (цена коснулась справедливой цены)
+        if low <= tp_price:
+            return {"status": "WIN", "time_to_take_mins": i + 1, "exit_price": tp_price}
+
+    return {"status": "TIMEOUT", "time_to_take_mins": 120}
+
+def generate_quant_charts(df: pd.DataFrame):
+    if df is None or df.empty:
+        return None
+    
+    # Подготовка данных
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['hour'] = df['timestamp'].dt.hour
+    
+    # Фильтруем только завершенные сделки
+    df_clean = df[df['status'].isin(['WIN', 'LOSS'])].copy()
+    if df_clean.empty:
+        return None
+
+    sns.set_theme(style="darkgrid")
+    fig, axes = plt.subplots(3, 1, figsize=(10, 15))
+    plt.subplots_adjust(hspace=0.4)
+
+    # График 1: Активность и Винрейт по часам
+    hourly_stats = df_clean.groupby('hour').agg(
+        count=('status', 'count'),
+        wins=('status', lambda x: (x == 'WIN').sum())
+    ).reset_index()
+    hourly_stats['winrate'] = (hourly_stats['wins'] / hourly_stats['count']) * 100
+    
+    # Заполняем пропуски часов (чтобы ось X была полной 0-23)
+    all_hours = pd.DataFrame({'hour': range(24)})
+    hourly_stats = pd.merge(all_hours, hourly_stats, on='hour', how='left').fillna(0)
+
+    ax1 = axes[0]
+    sns.barplot(data=hourly_stats, x='hour', y='count', ax=ax1, color='steelblue', alpha=0.7)
+    ax1.set_ylabel('Signals Count')
+    ax1.set_title('Распределение сигналов и Winrate по часам (UTC)')
+    
+    ax2 = ax1.twinx()
+    sns.lineplot(data=hourly_stats, x='hour', y='winrate', ax=ax2, color='red', marker='o')
+    ax2.set_ylabel('Winrate (%)')
+    ax2.set_ylim(0, 105)
+
+    # График 2: Объем vs Время
+    ax3 = axes[1]
+    if 'volume_24h' in df_clean.columns and 'time_to_take_mins' in df_clean.columns:
+        sns.scatterplot(data=df_clean, x='volume_24h', y='time_to_take_mins', hue='status', 
+                        palette={'WIN': 'green', 'LOSS': 'red'}, ax=ax3, alpha=0.6)
+        ax3.set_xscale('log')
+        ax3.set_title('Объем 24h vs Время до Тейк-Профита')
+
+    # График 3: Equity
+    ax4 = axes[2]
+    df_sorted = df_clean.sort_values('timestamp')
+    df_sorted['pnl'] = df_sorted['status'].apply(lambda x: 1 if x == 'WIN' else -1)
+    df_sorted['equity'] = df_sorted['pnl'].cumsum()
+    
+    sns.lineplot(data=df_sorted, x=range(len(df_sorted)), y='equity', ax=ax4, color='purple')
+    ax4.fill_between(range(len(df_sorted)), df_sorted['equity'], alpha=0.3, color='purple')
+    ax4.set_title('Динамика эффективности (Win/Loss Equity)')
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+async def collect_quant_data():
+    """Собирает данные по сигналам за 24 часа и проверяет их исход."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        query = "SELECT symbol, price, change_pct, volume_24h, timestamp FROM signals_splash WHERE timestamp > datetime('now', '-1 day')"
+        async with db.execute(query) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        return None
+
+    results = []
+    for row in rows:
+        symbol, price, change_pct, vol, ts = row
+        outcome = await check_signal_outcome(symbol, ts, price, change_pct)
+        
+        results.append({
+            "symbol": symbol,
+            "entry_price": price,
+            "change_pct": change_pct,
+            "volume_24h": vol,
+            "timestamp": ts,
+            "status": outcome.get("status"),
+            "time_to_take_mins": outcome.get("time_to_take_mins", 0)
+        })
+        await asyncio.sleep(0.1)
+
+    return pd.DataFrame(results)
+
+@dp.message(Command("report"))
+async def cmd_report(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    status_msg = await message.answer("⏳ Собираю свечи с MEXC и считаю метрики. Это займет пару минут...")
+    
+    try:
+        # 1. Сбор данных
+        df = await collect_quant_data()
+        
+        if df is None or df.empty:
+            await status_msg.edit_text("🤷‍♂️ За последние 24 часа сигналов не было.")
+            return
+
+        # 2. Генерация графиков
+        chart_buffer = generate_quant_charts(df)
+
+        # 3. Подготовка файлов (CSV и TXT)
+        # CSV (через строку, т.к. BytesIO требует байты, а to_csv пишет str)
+        csv_str = df.to_csv(index=False)
+        csv_buffer = io.BytesIO(csv_str.encode('utf-8'))
+
+        # Текстовая сводка
+        total = len(df)
+        wins = len(df[df["status"] == "WIN"])
+        winrate = (wins / total * 100) if total > 0 else 0
+        win_df = df[df["status"] == "WIN"]
+        avg_ttt = win_df["time_to_take_mins"].mean() if not win_df.empty else 0
+
+        summary = f"""📊 QUANT REPORT (24h)
+Total Signals: {total}
+Winrate: {winrate:.2f}%
+Avg Time to Take: {avg_ttt:.1f} min
+
+JSON Data for LLM:
+{df.to_json(orient="records")}
+"""
+        txt_buffer = io.BytesIO(summary.encode('utf-8'))
+        
+        # 4. Отправка сообщений
+        await status_msg.delete()
+
+        # Сообщение 1: Графики
+        if chart_buffer:
+            await message.answer_photo(
+                photo=types.BufferedInputFile(chart_buffer.getvalue(), filename="quant_charts.png"),
+                caption="📊 <b>Визуализация эффективности</b>"
+            )
+
+        # Сообщение 2: Файлы данных
+        await message.answer_media_group([
+            types.InputMediaDocument(media=types.BufferedInputFile(csv_buffer.getvalue(), filename="daily_quant_data.csv")),
+            types.InputMediaDocument(media=types.BufferedInputFile(txt_buffer.getvalue(), filename="llm_prompt.txt"), caption="✅ <b>Полный отчет готов</b>")
+        ])
+        
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка генерации отчета: {e}")
 
 async def keep_alive_ping():
     # FIX: Используем URL из окружения Render, или заглушку для локального теста

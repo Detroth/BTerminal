@@ -5,3 +5,6 @@ wsproto
 aiogram
 aiosqlite
 aiohttp
+pandas
+matplotlib
+seaborn
