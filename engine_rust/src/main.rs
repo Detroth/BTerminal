@@ -415,8 +415,8 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                     tickers.sort_by(|a, b| b.amount_24.partial_cmp(&a.amount_24).unwrap_or(std::cmp::Ordering::Equal));
                                     
                                     // FIX: Ограничиваем до 150 пар, чтобы не упереться в лимиты WebSocket
-                                    if tickers.len() > 250 {
-                                        tickers.truncate(250);
+                                    if tickers.len() > 350 {
+                                        tickers.truncate(350);
                                     }
                                     
                                     let min_vol = tickers.last().map(|t| t.amount_24).unwrap_or(0.0);
@@ -531,7 +531,7 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                             for pair in to_subscribe {
                                                 let msg = json!({ "method": "sub.deal", "param": { "symbol": pair } });
                                                 if tx.send(Message::Text(msg.to_string())).is_err() { break; }
-                                                // FIX: 35мс * 250 пар = ~8.7 сек. Укладываемся в 30 сек цикла.
+                                                // 35мс * 350 пар = ~12.25 сек. Укладываемся в 30 сек цикла.
                                                 sleep(Duration::from_millis(35)).await;
                                             }
                                         });
@@ -644,28 +644,31 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
                 symbol, growth_30 * 100.0, min_p_30, max_p_30, vol_24h, history.len());
         }
 
-        if growth_30 >= 0.09 {
-            let key = (symbol.to_string(), "SPLASH".to_string());
-            let on_cooldown = cooldowns.get(&key).map(|t| now_instant.duration_since(*t) < Duration::from_secs(60 * 60)).unwrap_or(false);
-            
-            if !on_cooldown {
-                println!("🚀 SPLASH TRIGGER: {} Growth: {:.2}% Vol: {:.0}", symbol, growth_30 * 100.0, vol_24h);
-                cooldowns.insert(key, now_instant);
-                let msg = json!({
-                    "type": "momentum",
-                    "data": [{
-                        "symbol": symbol,
-                        "signal_type": "SPLASH",
-                        "current_price": history.back().unwrap().close,
-                        "fair_price": (max_p_30 + min_p_30) / 2.0,
-                        "change_pct": growth_30 * 100.0,
-                        "volume_24h": vol_24h,
-                        "timestamp": now_unix
-                    }]
-                });
-                let _ = tx.send(Message::Text(msg.to_string()));
-            } else {
-                println!("❄️ COOLDOWN: {} (SPLASH already sent < 60m ago)", symbol);
+        // FIX: Tiered Cooldowns. Отправляем сигнал для каждого порога, который пересекается.
+        // Это позволяет пользователям с разными фильтрами (9%, 12%, 50%) получать свои уведомления.
+        let tiers = [(0.50, "SPLASH_50"), (0.12, "SPLASH_12"), (0.09, "SPLASH_9")];
+        for &(threshold, tier_name) in &tiers {
+            if growth_30 >= threshold {
+                let key = (symbol.to_string(), tier_name.to_string());
+                let on_cooldown = cooldowns.get(&key).map(|t| now_instant.duration_since(*t) < Duration::from_secs(60 * 60)).unwrap_or(false);
+
+                if !on_cooldown {
+                    println!("🚀 {} TRIGGER: {} Growth: {:.2}% Vol: {:.0}", tier_name, symbol, growth_30 * 100.0, vol_24h);
+                    cooldowns.insert(key, now_instant);
+                    let msg = json!({
+                        "type": "momentum",
+                        "data": [{
+                            "symbol": symbol,
+                            "signal_type": "SPLASH",
+                            "current_price": history.back().unwrap().close,
+                            "fair_price": (max_p_30 + min_p_30) / 2.0,
+                            "change_pct": growth_30 * 100.0,
+                            "volume_24h": vol_24h,
+                            "timestamp": now_unix
+                        }]
+                    });
+                    let _ = tx.send(Message::Text(msg.to_string()));
+                }
             }
         }
     }

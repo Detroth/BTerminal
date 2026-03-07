@@ -17,12 +17,15 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 
 # --- TELEGRAM BOT SETUP ---
 #API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-API_TOKEN = "8634666749:AAH1TxnkbsqpYeZ2GZEajobQ8cJoEIX2vzo"
+API_TOKEN = "8634666749:AAEZWaxSUGUlXIu0-60S_0X1sGpsA4uK7MA"
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1115714808")) # ID админа для доступа к статистике
 
 # Инициализация бота и диспетчера
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+# --- GLOBAL STATE ---
+last_internal_message_time = None
 
 # --- DATABASE SETUP ---
 DB_NAME = os.environ.get("DB_PATH", "quant_journal.db")
@@ -56,6 +59,7 @@ async def init_db():
                 symbol TEXT,
                 entry_price REAL,
                 fair_price REAL,
+                change_pct REAL,
                 volume_24h REAL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -185,8 +189,96 @@ async def cmd_quant(message: types.Message):
     except Exception as e:
         await message.answer(f"⚠️ Ошибка получения статистики: {e}")
 
+@dp.message(Command("status"))
+async def cmd_status(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    global last_internal_message_time
+    if last_internal_message_time:
+        time_since_last_signal = datetime.datetime.now() - last_internal_message_time
+        status_text = f"✅ <b>Движок активен.</b>\nПоследний сигнал от Rust: {time_since_last_signal.total_seconds():.1f} сек. назад."
+    else:
+        status_text = "⚠️ <b>Движок неактивен</b> или еще не присылал данных."
+    
+    await message.answer(status_text)
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    text_to_send = message.text.replace("/broadcast", "").strip()
+    if not text_to_send:
+        await message.answer("⚠️ Укажите текст для рассылки после команды.\nПример: `/broadcast Всем привет!`")
+        return
+
+    sent_count = 0
+    failed_count = 0
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT telegram_id FROM users") as cursor:
+            users = await cursor.fetchall()
+    
+    await message.answer(f"🚀 Начинаю рассылку для {len(users)} пользователей...")
+
+    for user in users:
+        uid = user[0]
+        try:
+            await bot.send_message(uid, text_to_send)
+            sent_count += 1
+            await asyncio.sleep(0.1) # Защита от rate-limit со стороны Telegram
+        except Exception as e:
+            print(f"Failed to broadcast to {uid}: {e}")
+            failed_count += 1
+    
+    await message.answer(f"✅ Рассылка завершена.\nОтправлено: {sent_count}\nОшибок: {failed_count}")
+
+@dp.message(Command("last_alerts"))
+async def cmd_last_alerts(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        query = """
+        SELECT symbol, 'SPLASH' as signal_type, change_pct, timestamp FROM signals_splash
+        UNION ALL
+        SELECT symbol, 'ADVANCED' as signal_type, change_pct, timestamp FROM signals_advanced
+        ORDER BY timestamp DESC
+        LIMIT 3
+        """
+        async with db.execute(query) as cursor:
+            last_signals = await cursor.fetchall()
+
+    if not last_signals:
+        return await message.answer("🤷‍♂️ Еще не было отправлено ни одного алерта.")
+
+    response_text = "<b>Последние 3 отправленных сигнала:</b>\n\n"
+    for symbol, signal_type, change_pct, ts in last_signals:
+        response_text += f"<b>{signal_type}</b>: #{symbol} (+{change_pct:.2f}%) в {ts}\n"
+    
+    await message.answer(response_text)
+
+@dp.message(Command("list_users"))
+async def cmd_list_users(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT telegram_id FROM users") as cursor:
+            users = await cursor.fetchall()
+    
+    if not users:
+        return await message.answer("👥 В системе пока нет пользователей.")
+    
+    response_text = f"<b>Список пользователей ({len(users)}):</b>\n"
+    for user in users:
+        response_text += f"- `{user[0]}`\n"
+    
+    await message.answer(response_text)
+
 async def keep_alive_ping():
-    EXTERNAL_URL = "https://quant-test.onrender.com"
+    # FIX: Используем URL из окружения Render, или заглушку для локального теста
+    EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:10000")
     while True:
         await asyncio.sleep(600)
         try:
@@ -251,6 +343,9 @@ async def internal_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
+            global last_internal_message_time
+            last_internal_message_time = datetime.datetime.now()
+
             data = await websocket.receive_json()
             await manager.broadcast(data)
             
@@ -281,7 +376,7 @@ async def internal_endpoint(websocket: WebSocket):
                         if signal_type == "SPLASH":
                             await db.execute("INSERT INTO signals_splash (symbol, price, change_pct, volume_24h, timestamp) VALUES (?, ?, ?, ?, ?)", (symbol, price, change_pct, volume_24h, timestamp_converted))
                         elif signal_type == "ADVANCED":
-                            await db.execute("INSERT INTO signals_advanced (symbol, entry_price, fair_price, volume_24h, timestamp) VALUES (?, ?, ?, ?, ?)", (symbol, price, fair_price, volume_24h, timestamp_converted))
+                            await db.execute("INSERT INTO signals_advanced (symbol, entry_price, fair_price, change_pct, volume_24h, timestamp) VALUES (?, ?, ?, ?, ?, ?)", (symbol, price, fair_price, change_pct, volume_24h, timestamp_converted))
                         await db.commit()
 
                         # 2. Рассылка пользователям (Роутинг)
