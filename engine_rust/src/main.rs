@@ -497,8 +497,15 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                         Some(ctrl) = ctrl_rx.recv() => {
                             match ctrl {
                                 ScannerControl::MarketUpdate { targets, daily_changes, daily_volumes } => {
-                                    state.daily_changes = daily_changes;
-                                    state.daily_volumes = daily_volumes;
+                                    // FIX: Не перезаписываем карты полностью, а обновляем (Merge), 
+                                    // чтобы не терять данные о монетах, которые временно выпали из топа
+                                    for (k, v) in daily_changes {
+                                        state.daily_changes.insert(k, v);
+                                    }
+                                    for (k, v) in daily_volumes {
+                                        state.daily_volumes.insert(k, v);
+                                    }
+
                                     let new_set: HashSet<String> = targets.into_iter().collect();
                                     
                                     // Subscribe new
@@ -530,8 +537,10 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                         let msg = json!({ "method": "unsub.deal", "param": { "symbol": pair } });
                                         let _ = ws_msg_tx_pong.send(Message::Text(msg.to_string()));
                                         
-                                        state.history.remove(&pair);
-                                        state.current_candles.remove(&pair);
+                                        // FIX: "Амнезия". Не удаляем историю при отписке. 
+                                        // Если монета вернется в топ через минуту, мы должны помнить её уровни.
+                                        // state.history.remove(&pair);
+                                        // state.current_candles.remove(&pair);
                                     }
                                     
                                     subscribed_set = new_set;
@@ -613,8 +622,8 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
     if min_p_30 > 0.0 {
         let growth_30 = (max_p_30 - min_p_30) / min_p_30;
         
-        // DEBUG: Логируем заметные движения (>5%), чтобы проверить видимость
-        if growth_30 > 0.05 {
+        // DEBUG: Снижаем порог логов до 1%, чтобы видеть, что математика работает
+        if growth_30 > 0.01 {
              println!("👀 WATCH: {} Growth: {:.2}% (Min: {}, Max: {}) Vol: {:.0} Hist: {}", 
                 symbol, growth_30 * 100.0, min_p_30, max_p_30, vol_24h, history.len());
         }
