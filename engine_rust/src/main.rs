@@ -332,8 +332,8 @@ struct MexcData {
     p: f64,
     v: f64,
     #[serde(rename = "T")]
-    side: i32, // 1: Buy, 2: Sell
-    t: u64,
+    side: Option<i32>, // Делаем необязательным, чтобы не ломать парсинг
+    t: Option<u64>,    // Делаем необязательным
 }
 
 #[derive(Debug, Clone)]
@@ -352,6 +352,7 @@ struct MexcScannerState {
     cooldowns: HashMap<(String, String), Instant>,
     daily_changes: HashMap<String, f64>,
     daily_volumes: HashMap<String, f64>,
+    tick_counter: u64, // Для отладки пульса
 }
 
 enum ScannerControl {
@@ -440,7 +441,8 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                 }
                             }
                         }
-                        sleep(Duration::from_secs(15)).await;
+                        // FIX: Увеличиваем паузу до 30с, чтобы очередь подписок успевала пройти
+                        sleep(Duration::from_secs(30)).await;
                     }
                 });
 
@@ -451,6 +453,7 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                     cooldowns: HashMap::new(),
                     daily_changes: HashMap::new(),
                     daily_volumes: HashMap::new(),
+                    tick_counter: 0,
                 };
                 
                 let mut subscribed_set: HashSet<String> = HashSet::new();
@@ -483,8 +486,13 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                     };
 
                                     if let (Some(symbol), Some(data_obj)) = (v["symbol"].as_str(), v["data"].as_object()) {
-                                        if let Ok(data) = serde_json::from_value::<MexcData>(v["data"].clone()) {
-                                            process_mexc_candle(symbol, data, &mut state, &tx).await;
+                                        match serde_json::from_value::<MexcData>(v["data"].clone()) {
+                                            Ok(data) => {
+                                                process_mexc_candle(symbol, data, &mut state, &tx).await;
+                                            },
+                                            Err(e) => {
+                                                println!("⚠️ DATA PARSE ERROR for {}: {}", symbol, e);
+                                            }
                                         }
                                     } else {
                                         println!("ℹ️ WS MSG: {}", text);
@@ -521,8 +529,8 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                             for pair in to_subscribe {
                                                 let msg = json!({ "method": "sub.deal", "param": { "symbol": pair } });
                                                 if tx.send(Message::Text(msg.to_string())).is_err() { break; }
-                                                // FIX: Замедляем очередь (50мс), чтобы биржа успевала обрабатывать подписки
-                                                sleep(Duration::from_millis(50)).await;
+                                                // FIX: 35мс * 250 пар = ~8.7 сек. Укладываемся в 30 сек цикла.
+                                                sleep(Duration::from_millis(35)).await;
                                             }
                                         });
                                     }
@@ -562,6 +570,12 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
 async fn process_mexc_candle(symbol: &str, data: MexcData, state: &mut MexcScannerState, tx: &mpsc::UnboundedSender<Message>) {
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
     let current_minute = now_ms / 60_000;
+
+    // DEBUG: Пульс, чтобы видеть, что данные идут
+    state.tick_counter += 1;
+    if state.tick_counter % 1000 == 0 {
+        println!("💓 PULSE: Processed {} ticks. Last: {} @ {}", state.tick_counter, symbol, data.p);
+    }
 
     let candle = state.current_candles.entry(symbol.to_string()).or_insert(TickData {
         timestamp: current_minute,
