@@ -485,13 +485,15 @@ async fn mexc_cvd_scanner(tx: mpsc::UnboundedSender<Message>) {
                                         Err(_) => { println!("⚠️ WS MALFORMED: {}", text); continue; }
                                     };
 
-                                    if let (Some(symbol), Some(data_obj)) = (v["symbol"].as_str(), v["data"].as_object()) {
-                                        match serde_json::from_value::<MexcData>(v["data"].clone()) {
-                                            Ok(data) => {
-                                                process_mexc_candle(symbol, data, &mut state, &tx).await;
-                                            },
-                                            Err(e) => {
-                                                println!("⚠️ DATA PARSE ERROR for {}: {}", symbol, e);
+                                    if let (Some(symbol), Some(data_arr)) = (v["symbol"].as_str(), v["data"].as_array()) {
+                                        for item in data_arr {
+                                            match serde_json::from_value::<MexcData>(item.clone()) {
+                                                Ok(data) => {
+                                                    process_mexc_candle(symbol, data, &mut state, &tx).await;
+                                                },
+                                                Err(e) => {
+                                                    println!("⚠️ DATA PARSE ERROR for {}: {}", symbol, e);
+                                                }
                                             }
                                         }
                                     } else {

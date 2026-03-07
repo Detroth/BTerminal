@@ -17,7 +17,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 
 # --- TELEGRAM BOT SETUP ---
 #API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-API_TOKEN = "8634666749:AAGHj5wzfe0nQWZ-AAnSN9iv91dAwVNbxhY"
+API_TOKEN = "8634666749:AAH1TxnkbsqpYeZ2GZEajobQ8cJoEIX2vzo"
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1115714808")) # ID админа для доступа к статистике
 
 # Инициализация бота и диспетчера
