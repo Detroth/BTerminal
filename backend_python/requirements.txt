@@ -8,3 +8,5 @@ aiohttp
 pandas
 matplotlib
 seaborn
+fpdf
+numpy

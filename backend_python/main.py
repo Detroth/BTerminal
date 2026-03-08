@@ -89,6 +89,19 @@ async def init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Таблица сигналов MOMENTUM
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS signals_momentum (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                entry_price REAL,
+                fair_price REAL,
+                stop_loss REAL,
+                volume_24h REAL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
 @dp.message(Command("start"))
@@ -303,10 +316,11 @@ async def cmd_list_users(message: types.Message):
 
 # --- QUANT CHECKER & REPORTING ---
 
-async def check_signal_outcome(symbol: str, signal_ts_str: str, entry_price: float, change_pct: float, stop_loss_price: float) -> dict:
+async def check_signal_outcome(symbol: str, signal_ts_str: str, entry_price: float, tp_price: float, sl_price: float, is_long: bool = False) -> dict:
     """
     Валидирует сигнал по историческим данным MEXC (Spot API).
-    Стратегия: Short (Mean Reversion) на пампе.
+    Стратегия: Short (Mean Reversion) или Long (Momentum).
+    Возвращает статус и Realized PnL % (для шорта: падение цены = плюс).
     """
     # 1. Подготовка параметров
     # MEXC Spot V3 требует формат BTCUSDT, а у нас BTC_USDT
@@ -320,17 +334,7 @@ async def check_signal_outcome(symbol: str, signal_ts_str: str, entry_price: flo
     except ValueError:
         return {"status": "ERROR", "reason": "Date parse fail"}
 
-    # 2. Расчет уровней (предполагаем Short на пампе)
-    # Если цена выросла на change_pct, значит Low движения был:
-    implied_low = entry_price / (1 + change_pct / 100.0)
-    
-    # Take Profit: 50% отката движения (Fair Price)
-    tp_price = (entry_price + implied_low) / 2.0
-    
-    # Stop Loss: Используем переданный динамический уровень (ATR) или расчетный
-    sl_price = stop_loss_price
-
-    # 3. Запрос к API
+        # 2. Запрос к API
     url = "https://api.mexc.com/api/v3/klines"
     params = {
         "symbol": clean_symbol,
@@ -364,8 +368,6 @@ async def check_signal_outcome(symbol: str, signal_ts_str: str, entry_price: flo
     for i, k in enumerate(klines):
         if i >= 15: break # Time-in-Trade Risk: Выходим, если за 15 минут нет результата
 
-        high = float(k[2])
-        low = float(k[3])
         # Защита от битых данных
         if len(k) < 5: continue
         
@@ -376,15 +378,36 @@ async def check_signal_outcome(symbol: str, signal_ts_str: str, entry_price: flo
         except (ValueError, IndexError):
             continue
         
-        # Проверка SL (цена ушла выше хая)
-        if high > sl_price:
-            return {"status": "LOSS", "time_to_take_mins": i + 1, "exit_price": high}
-        
-        # Проверка TP (цена коснулась справедливой цены)
-        if low <= tp_price:
-            return {"status": "WIN", "time_to_take_mins": i + 1, "exit_price": tp_price}
+        close_price = float(k[4])
 
-    return {"status": "TIME_STOP", "time_to_take_mins": 15}
+        if is_long:
+            # LONG STRATEGY
+            # Проверка SL (цена ушла ниже стопа)
+            if low < sl_price:
+                pnl_pct = ((sl_price - entry_price) / entry_price) * 100
+                return {"status": "LOSS", "time_to_take_mins": i + 1, "exit_price": sl_price, "realized_pnl_pct": pnl_pct}
+            # Проверка TP (цена коснулась тейка сверху)
+            if high >= tp_price:
+                pnl_pct = ((tp_price - entry_price) / entry_price) * 100
+                return {"status": "WIN", "time_to_take_mins": i + 1, "exit_price": tp_price, "realized_pnl_pct": pnl_pct}
+        else:
+            # SHORT STRATEGY
+            # Проверка SL (цена ушла выше хая)
+            if high > sl_price:
+                # PnL для шорта: (Вход - Выход) / Вход. Если вышли выше входа -> минус.
+                pnl_pct = ((entry_price - sl_price) / entry_price) * 100
+                return {"status": "LOSS", "time_to_take_mins": i + 1, "exit_price": sl_price, "realized_pnl_pct": pnl_pct}
+            
+            # Проверка TP (цена коснулась справедливой цены)
+            if low <= tp_price:
+                pnl_pct = ((entry_price - tp_price) / entry_price) * 100
+                return {"status": "WIN", "time_to_take_mins": i + 1, "exit_price": tp_price, "realized_pnl_pct": pnl_pct}
+
+    # Time Stop (выход по закрытию последней свечи)
+    last_close = float(klines[min(14, len(klines)-1)][4])
+    if is_long: pnl_pct = ((last_close - entry_price) / entry_price) * 100
+    else: pnl_pct = ((entry_price - last_close) / entry_price) * 100
+    return {"status": "TIME_STOP", "time_to_take_mins": 15, "exit_price": last_close, "realized_pnl_pct": pnl_pct}
 
 def generate_quant_charts(df: pd.DataFrame):
     if df is None or df.empty:
@@ -459,7 +482,7 @@ async def collect_quant_data():
             rows_splash = await cursor.fetchall()
             
         # Advanced Signals (теперь с stop_loss)
-        query_adv = "SELECT symbol, entry_price, change_pct, volume_24h, timestamp, stop_loss FROM signals_advanced WHERE timestamp > datetime('now', '-1 day')"
+        query_adv = "SELECT symbol, entry_price, change_pct, volume_24h, timestamp, stop_loss, fair_price FROM signals_advanced WHERE timestamp > datetime('now', '-1 day')"
         async with db.execute(query_adv) as cursor:
             rows_adv = await cursor.fetchall()
 
@@ -468,7 +491,12 @@ async def collect_quant_data():
         async with db.execute(query_fade) as cursor:
             rows_fade = await cursor.fetchall()
 
-    if not rows_splash and not rows_adv and not rows_fade:
+        # Momentum Signals
+        query_mom = "SELECT symbol, entry_price, fair_price, stop_loss, volume_24h, timestamp FROM signals_momentum WHERE timestamp > datetime('now', '-1 day')"
+        async with db.execute(query_mom) as cursor:
+            rows_mom = await cursor.fetchall()
+
+    if not rows_splash and not rows_adv and not rows_fade and not rows_mom:
         return None
 
     results = []
@@ -476,9 +504,13 @@ async def collect_quant_data():
     # 2. Обработка Splash (с сегментацией)
     for row in rows_splash:
         symbol, price, change_pct, vol, ts = row
-        # Для Splash используем старую логику стопа (High + 0.5%), так как ATR там не считается
-        default_sl = price * 1.005
-        outcome = await check_signal_outcome(symbol, ts, price, change_pct, default_sl)
+        
+        # Рассчитываем уровни для SPLASH на лету (как раньше)
+        implied_low = price / (1 + change_pct / 100.0)
+        tp_price = (price + implied_low) / 2.0
+        sl_price = price * 1.005
+        
+        outcome = await check_signal_outcome(symbol, ts, price, tp_price, sl_price, is_long=False)
         
         # Тир определяется позже через pandas, но пока ставим заглушку или определяем тут
         # Для скорости сделаем это в pandas
@@ -490,14 +522,15 @@ async def collect_quant_data():
             "timestamp": ts,
             "type": "SPLASH", # Временная метка
             "status": outcome.get("status"),
-            "time_to_take_mins": outcome.get("time_to_take_mins", 0)
+            "time_to_take_mins": outcome.get("time_to_take_mins", 0),
+            "realized_pnl_pct": outcome.get("realized_pnl_pct", 0.0)
         })
         await asyncio.sleep(0.1)
 
     # 3. Обработка Advanced
     for row in rows_adv:
-        symbol, price, change_pct, vol, ts, sl = row
-        outcome = await check_signal_outcome(symbol, ts, price, change_pct, sl)
+        symbol, price, change_pct, vol, ts, sl, fair = row
+        outcome = await check_signal_outcome(symbol, ts, price, fair, sl, is_long=False)
         
         results.append({
             "symbol": symbol,
@@ -506,17 +539,17 @@ async def collect_quant_data():
             "volume_24h": vol,
             "timestamp": ts,
             "type": "ADVANCED",
-            "strategy_tier": "ADVANCED", # Сразу прописываем тир
+            "strategy_tier": "ADVANCED",
             "status": outcome.get("status"),
-            "time_to_take_mins": outcome.get("time_to_take_mins", 0)
+            "time_to_take_mins": outcome.get("time_to_take_mins", 0),
+            "realized_pnl_pct": outcome.get("realized_pnl_pct", 0.0)
         })
         await asyncio.sleep(0.1)
 
     # 4. Обработка Fade
     for row in rows_fade:
         symbol, price, fair, sl, vol, ts = row
-        # Для Fade передаем change_pct=0, так как в базе его нет, но стоп берем из базы
-        outcome = await check_signal_outcome(symbol, ts, price, 0.0, sl)
+        outcome = await check_signal_outcome(symbol, ts, price, fair, sl, is_long=False)
         
         results.append({
             "symbol": symbol,
@@ -527,11 +560,31 @@ async def collect_quant_data():
             "type": "FADE",
             "strategy_tier": "FADE",
             "status": outcome.get("status"),
-            "time_to_take_mins": outcome.get("time_to_take_mins", 0)
+            "time_to_take_mins": outcome.get("time_to_take_mins", 0),
+            "realized_pnl_pct": outcome.get("realized_pnl_pct", 0.0)
         })
         await asyncio.sleep(0.1)
 
-    # 5. Создание и сегментация DataFrame
+    # 5. Обработка Momentum (LONG)
+    for row in rows_mom:
+        symbol, price, fair, sl, vol, ts = row
+        outcome = await check_signal_outcome(symbol, ts, price, fair, sl, is_long=True)
+        
+        results.append({
+            "symbol": symbol,
+            "entry_price": price,
+            "change_pct": 0.0,
+            "volume_24h": vol,
+            "timestamp": ts,
+            "type": "MOMENTUM",
+            "strategy_tier": "MOMENTUM",
+            "status": outcome.get("status"),
+            "time_to_take_mins": outcome.get("time_to_take_mins", 0),
+            "realized_pnl_pct": outcome.get("realized_pnl_pct", 0.0)
+        })
+        await asyncio.sleep(0.1)
+
+    # 6. Создание и сегментация DataFrame
     df = pd.DataFrame(results)
     
     if not df.empty:
@@ -721,6 +774,8 @@ async def internal_endpoint(websocket: WebSocket):
                             await db.execute("INSERT INTO signals_advanced (symbol, entry_price, fair_price, change_pct, volume_24h, timestamp, stop_loss) VALUES (?, ?, ?, ?, ?, ?, ?)", (symbol, price, fair_price, change_pct, volume_24h, timestamp_converted, stop_loss))
                         elif signal_type == "FADE":
                             await db.execute("INSERT INTO signals_fade (symbol, entry_price, fair_price, stop_loss, volume_24h, timestamp) VALUES (?, ?, ?, ?, ?, ?)", (symbol, price, fair_price, stop_loss, volume_24h, timestamp_converted))
+                        elif signal_type == "MOMENTUM":
+                            await db.execute("INSERT INTO signals_momentum (symbol, entry_price, fair_price, stop_loss, volume_24h, timestamp) VALUES (?, ?, ?, ?, ?, ?)", (symbol, price, fair_price, stop_loss, volume_24h, timestamp_converted))
                         await db.commit()
 
                         # 2. Рассылка пользователям (Роутинг)
@@ -749,10 +804,14 @@ async def internal_endpoint(websocket: WebSocket):
                             elif signal_type == "FADE":
                                 # FADE отправляем всем, кто проходит по объему (пока без отдельного тумблера)
                                 send = True
+                            elif signal_type == "MOMENTUM":
+                                send = True
                             
                             if send:
                                 if signal_type == "FADE":
                                     msg_text = f"<b>📉 Затухание Объема (FADE)</b>\nПара: #{symbol}\nВход: {price}\nТейк: {fair_price}\nСтоп (ATR): {stop_loss}\nОбъем 24h: ${volume_24h:,.0f}\nВремя: {timestamp_converted}"
+                                elif signal_type == "MOMENTUM":
+                                    msg_text = f"<b>🚀 Импульсный Пробой (MOMENTUM)</b>\nПара: #{symbol}\nЛонг от: {price}\nТейк: {fair_price}\nСтоп: {stop_loss}\nОбъем 24h: ${volume_24h:,.0f}\nВремя: {timestamp_converted}"
                                 else:
                                     msg_text = f"<b>⚡️ {signal_type}</b>\nПара: #{symbol}\nИзменение: +{change_pct:.2f}%\nЦена: {price}\nСправедливая цена: {fair_price}\nОбъем 24h: ${volume_24h:,.0f}\nВремя: {timestamp_converted}"
                                 

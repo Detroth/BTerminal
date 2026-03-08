@@ -720,8 +720,8 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
                 if !on_cooldown {
                     let fair_price = max_p_30 - ((max_p_30 - min_p_30) * 0.382); // Take Profit 38.2% Fib
                     
-                    // Dynamic Stop Loss for FADE: High + 1.5 * ATR
-                    let stop_loss = if atr > 0.0 { max_p_30 + (1.5 * atr) } else { max_p_30 * 1.005 };
+                    // Dynamic Stop Loss for FADE: High + 1.0 * ATR
+                    let stop_loss = if atr > 0.0 { max_p_30 + (1.0 * atr) } else { max_p_30 * 1.005 };
                     
                     cooldowns.insert(fade_key, now_instant);
                     let msg = json!({
@@ -730,6 +730,7 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
                             "symbol": symbol,
                             "signal_type": "FADE",
                             "current_price": current_price,
+                            "entry_price": current_price,
                             "fair_price": fair_price,
                             "stop_loss": stop_loss,
                             "change_pct": (max_p_30 - min_p_30) / min_p_30 * 100.0,
@@ -741,6 +742,70 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
                     println!("📉 FADE TRIGGER: {} (Vol Fade: {:.0} vs Peak {:.0}, SL: {:.4})", symbol, last_closed_candle.volume, peak_volume, stop_loss);
                 }
             }
+        }
+    }
+
+    // --- STRATEGY 4: MOMENTUM (Impulse Long) ---
+    // Window: 5 mins
+    // Condition 1: Growth >= 4%
+    // Condition 2: Vol > 300% avg (15 mins)
+    // Condition 3: Close near High (< 0.2%)
+    if history.len() >= 20 {
+        let last_closed_idx = history.len() - 2;
+        let last_closed = &history[last_closed_idx];
+        
+        // Volume Avg (previous 15 mins before last closed)
+        let mut vol_sum = 0.0;
+        for i in 1..=15 {
+            vol_sum += history[last_closed_idx - i].volume;
+        }
+        let vol_avg = if vol_sum > 0.0 { vol_sum / 15.0 } else { 1.0 };
+        
+        // Price Window (last 5 mins including current)
+        let start_5m = history.len().saturating_sub(6);
+        let mut min_5m = f64::MAX;
+        let mut max_5m = f64::MIN;
+        
+        for i in start_5m..history.len() {
+            let c = &history[i];
+            if c.low < min_5m { min_5m = c.low; }
+            if c.high > max_5m { max_5m = c.high; }
+        }
+        
+        let growth_5m = if min_5m > 0.0 { (max_5m - min_5m) / min_5m } else { 0.0 };
+        
+        let is_vol_spike = last_closed.volume > (vol_avg * 3.0);
+        let is_high_close = (last_closed.high - last_closed.close) / last_closed.close <= 0.002;
+        let is_fast_growth = growth_5m >= 0.04;
+        
+        if is_fast_growth && is_vol_spike && is_high_close {
+             let mom_key = (symbol.to_string(), "MOMENTUM".to_string());
+             let on_cooldown = cooldowns.get(&mom_key).map(|t| now_instant.duration_since(*t) < Duration::from_secs(30 * 60)).unwrap_or(false);
+             
+             if !on_cooldown {
+                 let current_price = history.back().unwrap().close;
+                 let tp = current_price * 1.02;
+                 let sl = current_price * 0.985;
+                 
+                 cooldowns.insert(mom_key, now_instant);
+                 
+                 let msg = json!({
+                    "type": "momentum",
+                    "data": [{
+                        "symbol": symbol,
+                        "signal_type": "MOMENTUM",
+                        "current_price": current_price,
+                        "entry_price": current_price,
+                        "fair_price": tp,
+                        "stop_loss": sl,
+                        "change_pct": growth_5m * 100.0,
+                        "volume_24h": vol_24h,
+                        "timestamp": now_unix
+                    }]
+                });
+                let _ = tx.send(Message::Text(msg.to_string()));
+                println!("🚀 MOMENTUM TRIGGER: {} (Growth: {:.2}%, Vol Spike: {:.1}x)", symbol, growth_5m * 100.0, last_closed.volume / vol_avg);
+             }
         }
     }
 
@@ -791,6 +856,7 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
                 "symbol": symbol,
                 "signal_type": "ADVANCED",
                 "current_price": current_price,
+                "entry_price": current_price,
                 "fair_price": take_profit,
                 "stop_loss": stop_loss,
                 "change_pct": growth_pct * 100.0,
