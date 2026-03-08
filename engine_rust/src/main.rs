@@ -626,13 +626,43 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
     let now_instant = Instant::now();
     let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     
+    // --- ATR CALCULATION (14 periods) ---
+    // Вычисляем ATR в начале, чтобы использовать во всех стратегиях (FADE, ADVANCED)
+    let mut tr_sum = 0.0;
+    let mut tr_count = 0;
+    let history_len = history.len();
+    
+    if history_len >= 2 {
+        // Calculate TR for up to last 14 candles
+        let start_atr = if history_len > 14 { history_len - 14 } else { 1 };
+        
+        for i in start_atr..history_len {
+            let curr = &history[i];
+            let prev = &history[i-1];
+            
+            let hl = curr.high - curr.low;
+            let h_pc = (curr.high - prev.close).abs();
+            let l_pc = (curr.low - prev.close).abs();
+            
+            let tr = hl.max(h_pc).max(l_pc);
+            tr_sum += tr;
+            tr_count += 1;
+        }
+    }
+    
+    let atr = if tr_count > 0 { tr_sum / tr_count as f64 } else { 0.0 };
+
     // --- STRATEGY 1: SPLASH (Global Inefficiency) ---
     // Window: 30 mins (Full history)
     let mut min_p_30 = f64::MAX;
     let mut max_p_30 = f64::MIN;
-    for candle in history.iter() {
+    let mut peak_volume = 0.0;
+
+    for (i, candle) in history.iter().enumerate() {
         if candle.low < min_p_30 { min_p_30 = candle.low; }
         if candle.high > max_p_30 { max_p_30 = candle.high; }
+        // Условие 2: Ищем пиковый объем (исключая текущую незавершенную свечу)
+        if i < history.len() - 1 && candle.volume > peak_volume { peak_volume = candle.volume; }
     }
 
     if min_p_30 > 0.0 {
@@ -668,6 +698,47 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
                         }]
                     });
                     let _ = tx.send(Message::Text(msg.to_string()));
+                }
+            }
+        }
+    }
+
+    // --- STRATEGY 3: FADE (Volume Exhaustion) ---
+    // Условие 1: Рост >= 9%
+    if min_p_30 > 0.0 && max_p_30 / min_p_30 >= 1.09 {
+        // Нам нужно минимум 2 свечи: текущая (активная) и предыдущая (закрытая)
+        if history.len() >= 2 {
+            let last_closed_candle = &history[history.len() - 2];
+            let current_price = history.back().unwrap().close;
+
+            // Условие 3: Затухание (Объем закрытой свечи <= 50% от пикового)
+            // Условие 4: Удержание высоты (Цена >= 97% от Хая)
+            if last_closed_candle.volume <= peak_volume * 0.5 && current_price >= max_p_30 * 0.97 {
+                let fade_key = (symbol.to_string(), "FADE".to_string());
+                let on_cooldown = cooldowns.get(&fade_key).map(|t| now_instant.duration_since(*t) < Duration::from_secs(60 * 60)).unwrap_or(false);
+                
+                if !on_cooldown {
+                    let fair_price = max_p_30 - ((max_p_30 - min_p_30) * 0.382); // Take Profit 38.2% Fib
+                    
+                    // Dynamic Stop Loss for FADE: High + 1.5 * ATR
+                    let stop_loss = if atr > 0.0 { max_p_30 + (1.5 * atr) } else { max_p_30 * 1.005 };
+                    
+                    cooldowns.insert(fade_key, now_instant);
+                    let msg = json!({
+                        "type": "momentum",
+                        "data": [{
+                            "symbol": symbol,
+                            "signal_type": "FADE",
+                            "current_price": current_price,
+                            "fair_price": fair_price,
+                            "stop_loss": stop_loss,
+                            "change_pct": (max_p_30 - min_p_30) / min_p_30 * 100.0,
+                            "volume_24h": vol_24h,
+                            "timestamp": now_unix
+                        }]
+                    });
+                    let _ = tx.send(Message::Text(msg.to_string()));
+                    println!("📉 FADE TRIGGER: {} (Vol Fade: {:.0} vs Peak {:.0}, SL: {:.4})", symbol, last_closed_candle.volume, peak_volume, stop_loss);
                 }
             }
         }
@@ -709,8 +780,9 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
 
     if !on_cooldown {
         let take_profit = max_price - ((max_price - min_price) * 0.5);
-        let stop_loss = max_price * 1.002;
-        let rr_ratio = if stop_loss - current_price != 0.0 { (current_price - take_profit) / (stop_loss - current_price) } else { 0.0 };
+        
+        // Dynamic Stop Loss: High + 1.5 * ATR
+        let stop_loss = if atr > 0.0 { max_price + (1.5 * atr) } else { max_price * 1.005 };
 
         cooldowns.insert(signal_key, now_instant);
         let msg = json!({
@@ -720,12 +792,13 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
                 "signal_type": "ADVANCED",
                 "current_price": current_price,
                 "fair_price": take_profit,
+                "stop_loss": stop_loss,
                 "change_pct": growth_pct * 100.0,
                 "volume_24h": vol_24h,
                 "timestamp": now_unix
             }]
         });
         let _ = tx.send(Message::Text(msg.to_string()));
-        println!("📉 ADVANCED: {}", symbol);
+        println!("📉 ADVANCED: {} (ATR: {:.4}, SL: {:.4})", symbol, atr, stop_loss);
     }
 }

@@ -23,7 +23,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 
 # --- TELEGRAM BOT SETUP ---
 #API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-API_TOKEN = "8634666749:AAGtDEll_hLpQm2VKfFZHbCNPUSW8KRPcNg"
+API_TOKEN = "8634666749:AAFLjIfgII4h_jibPnVKlMcJtm7CyJpb9hc"
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1115714808")) # ID админа для доступа к статистике
 
 # Инициализация бота и диспетчера
@@ -66,6 +66,25 @@ async def init_db():
                 entry_price REAL,
                 fair_price REAL,
                 change_pct REAL,
+                volume_24h REAL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Миграция: добавляем stop_loss в signals_advanced, если нет
+        try:
+            await db.execute("ALTER TABLE signals_advanced ADD COLUMN stop_loss REAL")
+        except Exception:
+            pass
+
+        # Таблица сигналов FADE
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS signals_fade (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                entry_price REAL,
+                fair_price REAL,
+                stop_loss REAL,
                 volume_24h REAL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -284,7 +303,7 @@ async def cmd_list_users(message: types.Message):
 
 # --- QUANT CHECKER & REPORTING ---
 
-async def check_signal_outcome(symbol: str, signal_ts_str: str, entry_price: float, change_pct: float) -> dict:
+async def check_signal_outcome(symbol: str, signal_ts_str: str, entry_price: float, change_pct: float, stop_loss_price: float) -> dict:
     """
     Валидирует сигнал по историческим данным MEXC (Spot API).
     Стратегия: Short (Mean Reversion) на пампе.
@@ -308,9 +327,8 @@ async def check_signal_outcome(symbol: str, signal_ts_str: str, entry_price: flo
     # Take Profit: 50% отката движения (Fair Price)
     tp_price = (entry_price + implied_low) / 2.0
     
-    # Stop Loss: Хай сплеша (в данном случае Entry Price, так как мы ловим вершину)
-    # Даем небольшой буфер 0.5% вверх, чтобы не выбивало шумом
-    sl_price = entry_price * 1.005
+    # Stop Loss: Используем переданный динамический уровень (ATR) или расчетный
+    sl_price = stop_loss_price
 
     # 3. Запрос к API
     url = "https://api.mexc.com/api/v3/klines"
@@ -318,7 +336,7 @@ async def check_signal_outcome(symbol: str, signal_ts_str: str, entry_price: flo
         "symbol": clean_symbol,
         "interval": "1m",
         "startTime": start_time,
-        "limit": 120 # 2 часа на отработку
+        "limit": 20 # Оптимизация: запрашиваем только 20 свечей (нам нужно 15 мин)
     }
 
     # Добавляем User-Agent, так как MEXC часто блокирует запросы без него (Cloudflare)
@@ -344,6 +362,8 @@ async def check_signal_outcome(symbol: str, signal_ts_str: str, entry_price: flo
     # 4. Анализ свечей
     # kline format: [time, open, high, low, close, vol, ...]
     for i, k in enumerate(klines):
+        if i >= 15: break # Time-in-Trade Risk: Выходим, если за 15 минут нет результата
+
         high = float(k[2])
         low = float(k[3])
         # Защита от битых данных
@@ -364,7 +384,7 @@ async def check_signal_outcome(symbol: str, signal_ts_str: str, entry_price: flo
         if low <= tp_price:
             return {"status": "WIN", "time_to_take_mins": i + 1, "exit_price": tp_price}
 
-    return {"status": "TIMEOUT", "time_to_take_mins": 120}
+    return {"status": "TIME_STOP", "time_to_take_mins": 15}
 
 def generate_quant_charts(df: pd.DataFrame):
     if df is None or df.empty:
@@ -431,18 +451,53 @@ def generate_quant_charts(df: pd.DataFrame):
 
 async def collect_quant_data():
     """Собирает данные по сигналам за 24 часа и проверяет их исход."""
+    # 1. Загрузка сырых данных
     async with aiosqlite.connect(DB_NAME) as db:
-        query = "SELECT symbol, price, change_pct, volume_24h, timestamp FROM signals_splash WHERE timestamp > datetime('now', '-1 day')"
-        async with db.execute(query) as cursor:
-            rows = await cursor.fetchall()
+        # Splash Signals
+        query_splash = "SELECT symbol, price, change_pct, volume_24h, timestamp FROM signals_splash WHERE timestamp > datetime('now', '-1 day')"
+        async with db.execute(query_splash) as cursor:
+            rows_splash = await cursor.fetchall()
+            
+        # Advanced Signals (теперь с stop_loss)
+        query_adv = "SELECT symbol, entry_price, change_pct, volume_24h, timestamp, stop_loss FROM signals_advanced WHERE timestamp > datetime('now', '-1 day')"
+        async with db.execute(query_adv) as cursor:
+            rows_adv = await cursor.fetchall()
 
-    if not rows:
+        # Fade Signals
+        query_fade = "SELECT symbol, entry_price, fair_price, stop_loss, volume_24h, timestamp FROM signals_fade WHERE timestamp > datetime('now', '-1 day')"
+        async with db.execute(query_fade) as cursor:
+            rows_fade = await cursor.fetchall()
+
+    if not rows_splash and not rows_adv and not rows_fade:
         return None
 
     results = []
-    for row in rows:
+
+    # 2. Обработка Splash (с сегментацией)
+    for row in rows_splash:
         symbol, price, change_pct, vol, ts = row
-        outcome = await check_signal_outcome(symbol, ts, price, change_pct)
+        # Для Splash используем старую логику стопа (High + 0.5%), так как ATR там не считается
+        default_sl = price * 1.005
+        outcome = await check_signal_outcome(symbol, ts, price, change_pct, default_sl)
+        
+        # Тир определяется позже через pandas, но пока ставим заглушку или определяем тут
+        # Для скорости сделаем это в pandas
+        results.append({
+            "symbol": symbol,
+            "entry_price": price,
+            "change_pct": change_pct,
+            "volume_24h": vol,
+            "timestamp": ts,
+            "type": "SPLASH", # Временная метка
+            "status": outcome.get("status"),
+            "time_to_take_mins": outcome.get("time_to_take_mins", 0)
+        })
+        await asyncio.sleep(0.1)
+
+    # 3. Обработка Advanced
+    for row in rows_adv:
+        symbol, price, change_pct, vol, ts, sl = row
+        outcome = await check_signal_outcome(symbol, ts, price, change_pct, sl)
         
         results.append({
             "symbol": symbol,
@@ -450,12 +505,51 @@ async def collect_quant_data():
             "change_pct": change_pct,
             "volume_24h": vol,
             "timestamp": ts,
+            "type": "ADVANCED",
+            "strategy_tier": "ADVANCED", # Сразу прописываем тир
             "status": outcome.get("status"),
             "time_to_take_mins": outcome.get("time_to_take_mins", 0)
         })
         await asyncio.sleep(0.1)
 
-    return pd.DataFrame(results)
+    # 4. Обработка Fade
+    for row in rows_fade:
+        symbol, price, fair, sl, vol, ts = row
+        # Для Fade передаем change_pct=0, так как в базе его нет, но стоп берем из базы
+        outcome = await check_signal_outcome(symbol, ts, price, 0.0, sl)
+        
+        results.append({
+            "symbol": symbol,
+            "entry_price": price,
+            "change_pct": 0.0,
+            "volume_24h": vol,
+            "timestamp": ts,
+            "type": "FADE",
+            "strategy_tier": "FADE",
+            "status": outcome.get("status"),
+            "time_to_take_mins": outcome.get("time_to_take_mins", 0)
+        })
+        await asyncio.sleep(0.1)
+
+    # 5. Создание и сегментация DataFrame
+    df = pd.DataFrame(results)
+    
+    if not df.empty:
+        # Логика сегментации Splash
+        mask_splash = df['type'] == 'SPLASH'
+        
+        # Default
+        df.loc[mask_splash, 'strategy_tier'] = 'SPLASH_9%'
+        
+        # 12% - 49.99%
+        df.loc[mask_splash & (df['change_pct'] >= 12), 'strategy_tier'] = 'SPLASH_12%'
+        
+        # >= 50%
+        df.loc[mask_splash & (df['change_pct'] >= 50), 'strategy_tier'] = 'SPLASH_50%'
+        
+        # Убираем вспомогательную колонку type, если не нужна, но оставим для дебага
+
+    return df
 
 @dp.message(Command("report"))
 async def cmd_report(message: types.Message):
@@ -481,20 +575,27 @@ async def cmd_report(message: types.Message):
         csv_buffer = io.BytesIO(csv_str.encode('utf-8'))
 
         # Текстовая сводка
-        total = len(df)
-        wins = len(df[df["status"] == "WIN"])
-        winrate = (wins / total * 100) if total > 0 else 0
-        win_df = df[df["status"] == "WIN"]
-        avg_ttt = win_df["time_to_take_mins"].mean() if not win_df.empty else 0
-
-        summary = f"""📊 QUANT REPORT (24h)
-Total Signals: {total}
-Winrate: {winrate:.2f}%
-Avg Time to Take: {avg_ttt:.1f} min
-
-JSON Data for LLM:
-{df.to_json(orient="records")}
-"""
+        summary_lines = ["📊 <b>QUANT REPORT (24h)</b>"]
+        
+        # Группировка по стратегиям
+        if 'strategy_tier' in df.columns:
+            tiers = df['strategy_tier'].unique()
+            for tier in sorted(tiers):
+                tier_df = df[df['strategy_tier'] == tier]
+                total = len(tier_df)
+                wins = len(tier_df[tier_df["status"] == "WIN"])
+                losses = len(tier_df[tier_df["status"] == "LOSS"])
+                time_stops = len(tier_df[tier_df["status"] == "TIME_STOP"])
+                
+                winrate = (wins / total * 100) if total > 0 else 0.0
+                
+                summary_lines.append(f"\n🔹 <b>{tier}</b>")
+                summary_lines.append(f"   Sig: {total} | WR: {winrate:.1f}%")
+                summary_lines.append(f"   W/L/T: {wins}/{losses}/{time_stops}")
+        
+        summary_lines.append(f"\nJSON Data for LLM:\n{df.to_json(orient='records')}")
+        summary = "\n".join(summary_lines)
+        
         txt_buffer = io.BytesIO(summary.encode('utf-8'))
         
         # 4. Отправка сообщений
@@ -604,6 +705,7 @@ async def internal_endpoint(websocket: WebSocket):
                         price = item.get("current_price")
                         fair_price = item.get("fair_price")
                         change_pct = item.get("change_pct")
+                        stop_loss = item.get("stop_loss", 0.0)
                         volume_24h = item.get("volume_24h")
                         ts_raw = item.get("timestamp", 0)
                         
@@ -616,7 +718,9 @@ async def internal_endpoint(websocket: WebSocket):
                         if signal_type == "SPLASH":
                             await db.execute("INSERT INTO signals_splash (symbol, price, change_pct, volume_24h, timestamp) VALUES (?, ?, ?, ?, ?)", (symbol, price, change_pct, volume_24h, timestamp_converted))
                         elif signal_type == "ADVANCED":
-                            await db.execute("INSERT INTO signals_advanced (symbol, entry_price, fair_price, change_pct, volume_24h, timestamp) VALUES (?, ?, ?, ?, ?, ?)", (symbol, price, fair_price, change_pct, volume_24h, timestamp_converted))
+                            await db.execute("INSERT INTO signals_advanced (symbol, entry_price, fair_price, change_pct, volume_24h, timestamp, stop_loss) VALUES (?, ?, ?, ?, ?, ?, ?)", (symbol, price, fair_price, change_pct, volume_24h, timestamp_converted, stop_loss))
+                        elif signal_type == "FADE":
+                            await db.execute("INSERT INTO signals_fade (symbol, entry_price, fair_price, stop_loss, volume_24h, timestamp) VALUES (?, ?, ?, ?, ?, ?)", (symbol, price, fair_price, stop_loss, volume_24h, timestamp_converted))
                         await db.commit()
 
                         # 2. Рассылка пользователям (Роутинг)
@@ -642,9 +746,16 @@ async def internal_endpoint(websocket: WebSocket):
                                     send = True
                                 else:
                                     print(f"  ❌ User {uid}: Skip Advanced Disabled")
+                            elif signal_type == "FADE":
+                                # FADE отправляем всем, кто проходит по объему (пока без отдельного тумблера)
+                                send = True
                             
                             if send:
-                                msg_text = f"<b>⚡️ {signal_type}</b>\nПара: #{symbol}\nИзменение: +{change_pct:.2f}%\nЦена: {price}\nСправедливая цена: {fair_price}\nОбъем 24h: ${volume_24h:,.0f}\nВремя: {timestamp_converted}"
+                                if signal_type == "FADE":
+                                    msg_text = f"<b>📉 Затухание Объема (FADE)</b>\nПара: #{symbol}\nВход: {price}\nТейк: {fair_price}\nСтоп (ATR): {stop_loss}\nОбъем 24h: ${volume_24h:,.0f}\nВремя: {timestamp_converted}"
+                                else:
+                                    msg_text = f"<b>⚡️ {signal_type}</b>\nПара: #{symbol}\nИзменение: +{change_pct:.2f}%\nЦена: {price}\nСправедливая цена: {fair_price}\nОбъем 24h: ${volume_24h:,.0f}\nВремя: {timestamp_converted}"
+                                
                                 try:
                                     print(f"  ✅ User {uid}: SENDING ALERT...")
                                     await bot.send_message(uid, msg_text)
