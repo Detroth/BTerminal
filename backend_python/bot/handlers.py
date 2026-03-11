@@ -2,17 +2,19 @@ import asyncio
 import io
 import datetime
 import aiosqlite
-from aiogram import types, F
+from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, BufferedInputFile, InputMediaDocument
-from bot.loader import bot, dp
+from bot.loader import bot
 from bot.keyboards import get_settings_keyboard
 from config import DB_NAME, ADMIN_ID
 from engine.shared_state import last_internal_message_time
 from analytics.checker import collect_quant_data
 from analytics.pdf_generator import generate_quant_charts
 
-@dp.message(Command("start"))
+router = Router()
+
+@router.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
@@ -20,7 +22,7 @@ async def cmd_start(message: types.Message):
         await db.commit()
     await message.answer("🚀 <b>SaaS Терминал запущен.</b>\nИспользуйте /settings для настройки персональных фильтров.")
 
-@dp.message(Command("settings"))
+@router.message(Command("settings"))
 async def cmd_settings(message: types.Message):
     user_id = message.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
@@ -31,7 +33,7 @@ async def cmd_settings(message: types.Message):
     
     await message.answer("⚙️ <b>Персональные фильтры:</b>\nНастройте уведомления под свой риск-профиль.", reply_markup=get_settings_keyboard(row))
 
-@dp.callback_query(F.data == "toggle_splash")
+@router.callback_query(F.data == "toggle_splash")
 async def cb_toggle_splash(callback: CallbackQuery):
     user_id = callback.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
@@ -52,7 +54,7 @@ async def cb_toggle_splash(callback: CallbackQuery):
     await callback.message.edit_text("⚙️ <b>Персональные фильтры:</b>\nНастройте уведомления под свой риск-профиль.", reply_markup=get_settings_keyboard(row))
     await callback.answer("Порог обновлен")
 
-@dp.callback_query(F.data == "toggle_advanced")
+@router.callback_query(F.data == "toggle_advanced")
 async def cb_toggle_advanced(callback: CallbackQuery):
     user_id = callback.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
@@ -69,7 +71,7 @@ async def cb_toggle_advanced(callback: CallbackQuery):
     await callback.message.edit_text("⚙️ <b>Персональные фильтры:</b>\nНастройте уведомления под свой риск-профиль.", reply_markup=get_settings_keyboard(row))
     await callback.answer("Стратегия переключена")
 
-@dp.callback_query(F.data == "toggle_volume")
+@router.callback_query(F.data == "toggle_volume")
 async def cb_toggle_volume(callback: CallbackQuery):
     user_id = callback.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
@@ -86,7 +88,7 @@ async def cb_toggle_volume(callback: CallbackQuery):
     await callback.message.edit_text("⚙️ <b>Персональные фильтры:</b>\nНастройте уведомления под свой риск-профиль.", reply_markup=get_settings_keyboard(row))
     await callback.answer("Фильтр объема обновлен")
 
-@dp.callback_query(F.data == "toggle_fade")
+@router.callback_query(F.data == "toggle_fade")
 async def cb_toggle_fade(callback: CallbackQuery):
     user_id = callback.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
@@ -103,7 +105,7 @@ async def cb_toggle_fade(callback: CallbackQuery):
     await callback.message.edit_text("⚙️ <b>Персональные фильтры:</b>\nНастройте уведомления под свой риск-профиль.", reply_markup=get_settings_keyboard(row))
     await callback.answer("Стратегия FADE переключена")
 
-@dp.callback_query(F.data == "toggle_momentum")
+@router.callback_query(F.data == "toggle_momentum")
 async def cb_toggle_momentum(callback: CallbackQuery):
     user_id = callback.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
@@ -120,7 +122,7 @@ async def cb_toggle_momentum(callback: CallbackQuery):
     await callback.message.edit_text("⚙️ <b>Персональные фильтры:</b>\nНастройте уведомления под свой риск-профиль.", reply_markup=get_settings_keyboard(row))
     await callback.answer("Стратегия MOMENTUM переключена")
 
-@dp.message(Command("quant"))
+@router.message(Command("quant"))
 async def cmd_quant(message: types.Message):
     try:
         async with aiosqlite.connect(DB_NAME) as db:
@@ -135,7 +137,7 @@ async def cmd_quant(message: types.Message):
     except Exception as e:
         await message.answer(f"⚠️ Ошибка получения статистики: {e}")
 
-@dp.message(Command("status"))
+@router.message(Command("status"))
 async def cmd_status(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     # Import shared state inside function to avoid circular import issues if any, though here it's fine
@@ -147,7 +149,7 @@ async def cmd_status(message: types.Message):
         status_text = "⚠️ <b>Движок неактивен</b> или еще не присылал данных."
     await message.answer(status_text)
 
-@dp.message(Command("broadcast"))
+@router.message(Command("broadcast"))
 async def cmd_broadcast(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     text_to_send = message.text.replace("/broadcast", "").strip()
@@ -173,7 +175,7 @@ async def cmd_broadcast(message: types.Message):
             failed_count += 1
     await message.answer(f"✅ Рассылка завершена.\nОтправлено: {sent_count}\nОшибок: {failed_count}")
 
-@dp.message(Command("last_alerts"))
+@router.message(Command("last_alerts"))
 async def cmd_last_alerts(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     async with aiosqlite.connect(DB_NAME) as db:
@@ -195,7 +197,7 @@ async def cmd_last_alerts(message: types.Message):
         response_text += f"<b>{signal_type}</b>: #{symbol} (+{change_pct:.2f}%) в {ts}\n"
     await message.answer(response_text)
 
-@dp.message(Command("list_users"))
+@router.message(Command("list_users"))
 async def cmd_list_users(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     async with aiosqlite.connect(DB_NAME) as db:
@@ -208,7 +210,7 @@ async def cmd_list_users(message: types.Message):
         response_text += f"- `{user[0]}`\n"
     await message.answer(response_text)
 
-@dp.message(Command("report"))
+@router.message(Command("report"))
 async def cmd_report(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     status_msg = await message.answer("⏳ Собираю свечи с MEXC и считаю метрики. Это займет пару минут...")

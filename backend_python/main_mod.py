@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from config import RENDER_EXTERNAL_URL
 from database.db_manager import init_db
 from bot.loader import bot, dp
-import bot.handlers # Register handlers
+from bot.handlers import router as bot_router
 from engine.ws_client import websocket_endpoint, internal_endpoint
 
 async def keep_alive_ping():
@@ -23,6 +23,7 @@ async def keep_alive_ping():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    dp.include_router(bot_router)
     polling_task = asyncio.create_task(dp.start_polling(bot))
     ping_task = asyncio.create_task(keep_alive_ping())
     yield
