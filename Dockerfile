@@ -29,10 +29,10 @@ RUN apt-get update && apt-get install -y openssl ca-certificates && rm -rf /var/
 COPY backend_python/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 🟢 ДОБАВЬ ВОТ ЭТУ СТРОКУ (Копируем папку с интерфейсом в корень сервера):
+# Копируем папку с интерфейсом в корень сервера
 COPY frontend/ /frontend/
 
-# Копируем весь код Питона
+# Копируем весь код Питона (включая новые папки bot, engine, database, analytics и main_mod.py)
 COPY backend_python/ .
 
 # Копируем бинарник (ПРИМЕЧАНИЕ: замени mexc_scanner на имя из твоего Cargo.toml)
