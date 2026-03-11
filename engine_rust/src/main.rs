@@ -666,34 +666,33 @@ async fn analyze_history(symbol: &str, history: &VecDeque<TickData>, cooldowns: 
     }
 
     if min_p_30 > 0.0 {
-        let current_price = history.back().unwrap().close;
-        let growth_from_low = (current_price - min_p_30) / min_p_30;
+        let growth_30 = (max_p_30 - min_p_30) / min_p_30;
         
-        // DEBUG: Снижаем порог логов до 5%, чтобы видеть, что математика работает
-        if growth_from_low > 0.05 {
-             println!("👀 WATCH: {} Growth: {:.2}% (Min: {}, Curr: {}) Vol: {:.0} Hist: {}", 
-                symbol, growth_from_low * 100.0, min_p_30, current_price, vol_24h, history.len());
+         // DEBUG: Снижаем порог логов до 1%, чтобы видеть, что математика работает
+        if growth_30 > 0.01 {
+             println!("👀 WATCH: {} Growth: {:.2}% (Min: {}, Max: {}) Vol: {:.0} Hist: {}", 
+                symbol, growth_30 * 100.0, min_p_30, max_p_30, vol_24h, history.len());
         }
 
         // FIX: Tiered Cooldowns. Отправляем сигнал для каждого порога, который пересекается.
         // Это позволяет пользователям с разными фильтрами (9%, 12%, 50%) получать свои уведомления.
         let tiers = [(0.50, "SPLASH_50"), (0.12, "SPLASH_12"), (0.09, "SPLASH_9")];
         for &(threshold, tier_name) in &tiers {
-            if growth_from_low >= threshold {
+            if growth_30 >= threshold {
                 let key = (symbol.to_string(), tier_name.to_string());
                 let on_cooldown = cooldowns.get(&key).map(|t| now_instant.duration_since(*t) < Duration::from_secs(60 * 60)).unwrap_or(false);
 
                 if !on_cooldown {
-                    println!("🚀 {} TRIGGER: {} Growth: {:.2}% Vol: {:.0}", tier_name, symbol, growth_from_low * 100.0, vol_24h);
+                    println!("🚀 {} TRIGGER: {} Growth: {:.2}% Vol: {:.0}", tier_name, symbol, growth_30 * 100.0, vol_24h);
                     cooldowns.insert(key, now_instant);
                     let msg = json!({
                         "type": "momentum",
                         "data": [{
                             "symbol": symbol,
                             "signal_type": "SPLASH",
-                            "current_price": current_price,
-                            "fair_price": (current_price + min_p_30) / 2.0,
-                            "change_pct": growth_from_low * 100.0,
+                            "current_price": history.back().unwrap().close,
+                            "fair_price": (max_p_30 + min_p_30) / 2.0,
+                            "change_pct": growth_30 * 100.0,
                             "volume_24h": vol_24h,
                             "timestamp": now_unix
                         }]
